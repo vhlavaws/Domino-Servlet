@@ -1,8 +1,12 @@
 # Ignore the config file with passwords
 servletconfig.xml
 servletconfig.json
+# Ignore libary dependencies
+lib/
+xxlib/
 
 # Also ignore compiled class files and VS Code internal state
 bin/
+
 *.class
 .vscode/

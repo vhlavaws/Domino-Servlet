@@ -1,0 +1,840 @@
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+import lotus.domino.NotesThread;
+
+import javax.servlet.ServletException;
+import javax.servlet.ServletConfig;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Map;
+import java.util.TimeZone;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * ApiCheckServlet — Multi-target API monitoring servlet for HCL Domino.
+ *
+ * Reads target configuration from servletconfig.nsf,
+ * logs calls to servletlog.nsf, supports per-subtype behavior:
+ *   - "TeamViewer" subtype: cached/async (returns last known result if API is slow)
+ *   - All other subtypes: synchronous (waits for actual response or timeout)
+ *
+ * URL pattern:
+ *   /servlet/ApiCheck?target=<name>&key=<secret>
+ *   /servlet/ApiCheck?action=status&key=<secret>     — show active calls and cache
+ *   /servlet/ApiCheck?action=reload&key=<secret>     — reload config from DB
+ *
+ * Deployment: see DEPLOYMENT.md
+ */
+public class ApiCheckServlet extends HttpServlet {
+
+    // ========================================================================
+    // CONFIGURATION CONSTANTS
+    // ========================================================================
+
+    /** Default seconds to wait for fresh result on cached subtypes */
+    private static final int DEFAULT_CACHE_WAIT_SEC = 20;
+
+    /** Default total seconds for background thread on cached subtypes */
+    private static final int DEFAULT_BG_TIMEOUT_SEC = 80;
+
+    /** Default connect timeout in milliseconds */
+    private static final int DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+
+    /** Default read timeout for synchronous subtypes (seconds) */
+    private static final int DEFAULT_SYNC_TIMEOUT_SEC = 60;
+
+    /** Max background threads for async API calls */
+    private static final int MAX_BG_THREADS = 15;
+
+    /** Domino server name for NotesFactory (empty = local) */
+    private static final String DOMINO_SERVER = "";
+
+    /** Config database filename */
+    //private static final String CONFIG_DB = "whitesoft/servletconfig.nsf";
+    private static final String CONFIG_DB = "whitesoft/noteslog.nsf";
+    /** Log database filename */
+    //private static final String LOG_DB = "whitesoft/servletlog.nsf";
+    private static final String LOG_DB = "whitesoft/noteslog.nsf";
+
+    // ========================================================================
+    // SHARED STATE
+    // ========================================================================
+
+    /** Target configurations loaded from servletconfig.nsf */
+    private static volatile Map<String, TargetConfig> targets
+        = new ConcurrentHashMap<>();
+
+    /** Per-target cached results */
+    private static final ConcurrentHashMap<String, CachedResult> cache
+        = new ConcurrentHashMap<>();
+
+    /** Per-target "call in progress" flags */
+    private static final ConcurrentHashMap<String, Object> inProgressLocks
+        = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Boolean> inProgress
+        = new ConcurrentHashMap<>();
+
+    /** Global active call counter */
+    private static final AtomicInteger activeCallCount = new AtomicInteger(0);
+
+    /** Thread pool for background API calls */
+    private static ExecutorService bgExecutor;
+
+    /** Secret key for access control */
+    private static String secretKey = "SECRET";
+
+    /** Servlet initialization timestamp */
+    private static long initTimestamp = 0;
+
+    // ========================================================================
+    // LIFECYCLE
+    // ========================================================================
+
+    @Override
+    public void init(ServletConfig config) throws ServletException {
+        super.init(config);
+        initTimestamp = System.currentTimeMillis();
+
+        // Read secret key from init args if provided
+        String keyParam = config.getInitParameter("secretKey");
+        if (keyParam != null && keyParam.length() > 0) {
+            secretKey = keyParam;
+        }
+
+        // Create bounded thread pool
+        bgExecutor = Executors.newFixedThreadPool(MAX_BG_THREADS);
+
+        // Load configurations from Domino DB
+        consoleLog("ApiCheckServlet: Initializing...");
+// TODO reloadConfig();
+        consoleLog("ApiCheckServlet: Initialized with "
+            + targets.size() + " targets.");
+    }
+
+    @Override
+    public void destroy() {
+        consoleLog("ApiCheckServlet: Shutting down...");
+        if (bgExecutor != null) {
+            bgExecutor.shutdownNow();
+        }
+        super.destroy();
+    }
+
+    // ========================================================================
+    // REQUEST HANDLING
+    // ========================================================================
+
+    @Override
+    public void doGet(HttpServletRequest request,
+                      HttpServletResponse response)
+            throws ServletException, IOException {
+
+        response.setContentType("application/json; charset=UTF-8");
+    
+        PrintWriter out = response.getWriter();
+
+        // --- Auth check ---
+        String keyParam = request.getParameter("key");
+        if (keyParam == null || !keyParam.equals(secretKey)) {
+            response.setStatus(403);
+            out.print("{\"error\":\"unauthorized\"}");
+            out.flush();
+            return;
+        }
+
+        // --- Action routing ---
+        String action = request.getParameter("action");
+        if ("status".equals(action)) {
+            handleStatus(response, out);
+            return;
+        }
+        if ("reload".equals(action)) {
+            handleReload(response, out);
+            return;
+        }
+
+        // --- Target check ---
+        String targetName = request.getParameter("target");
+        if (targetName == null || targetName.length() == 0) {
+            response.setStatus(400);
+            out.print("{\"error\":\"missing 'target' parameter\"}");
+            out.flush();
+            return;
+        }
+
+        TargetConfig tc = targets.get(targetName.toLowerCase());
+        if (tc == null) {
+            response.setStatus(404);
+            out.print("{\"error\":\"unknown target: " + escapeJson(targetName)
+                + "\", \"availableTargets\":" + targetListJson() + "}");
+            out.flush();
+            return;
+        }
+
+        // --- Dispatch based on subtype ---
+        consoleLog("ApiCheckServlet: [" + tc.subType + "] "
+            + "Checking target '" + tc.name + "' -> " + tc.apiUrl);
+
+        if (tc.useCachedMode) {
+            handleCachedTarget(tc, response, out);
+        } else {
+            handleSyncTarget(tc, response, out);
+        }
+    }
+
+    // ========================================================================
+    // SYNCHRONOUS TARGET HANDLING (Viber, ProfiSMS, Sametime, etc.)
+    // ========================================================================
+
+    /**
+     * Calls the API synchronously — waits for response or timeout.
+     * Returns the actual live result to the monitoring app.
+     */
+    private void handleSyncTarget(TargetConfig tc,
+                                  HttpServletResponse response,
+                                  PrintWriter out) {
+
+        int active = activeCallCount.incrementAndGet();
+        long startTime = System.currentTimeMillis();
+
+        consoleLog("ApiCheckServlet: [SYNC] '" + tc.name
+            + "' started (active calls: " + active + ")");
+
+        HttpURLConnection conn = null;
+        int apiCode = 0;
+        String apiData = null;
+        String errorMsg = null;
+
+        try {
+            URL url = new URL(tc.apiUrl);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod(tc.httpMethod);
+            conn.setConnectTimeout(tc.connectTimeoutMs);
+            conn.setReadTimeout(tc.readTimeoutSec * 1000);
+
+            // Set headers
+            if (tc.authHeader != null && tc.authHeader.length() > 0) {
+                conn.setRequestProperty("Authorization", tc.authHeader);
+            }
+            conn.setRequestProperty("Accept", "application/json");
+
+            // Add custom headers from config
+            if (tc.customHeaders != null) {
+                for (Map.Entry<String, String> h : tc.customHeaders.entrySet()) {
+                    conn.setRequestProperty(h.getKey(), h.getValue());
+                }
+            }
+
+            apiCode = conn.getResponseCode();
+            apiData = readStream(
+                (apiCode >= 200 && apiCode < 300)
+                    ? conn.getInputStream() : conn.getErrorStream());
+
+        } catch (java.net.SocketTimeoutException e) {
+            errorMsg = "timeout: " + e.getMessage();
+        } catch (java.net.ConnectException e) {
+            errorMsg = "connection_refused: " + e.getMessage();
+        } catch (IOException e) {
+            errorMsg = "io_error: " + e.getMessage();
+        } catch (Exception e) {
+            errorMsg = e.getClass().getSimpleName() + ": " + e.getMessage();
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+            activeCallCount.decrementAndGet();
+        }
+
+        long durationMs = System.currentTimeMillis() - startTime;
+
+        // Log to servletlog.nsf
+        logCallAsync(tc.name, tc.subType, tc.apiUrl, apiCode,
+            durationMs, errorMsg, "SYNC");
+
+        consoleLog("ApiCheckServlet: [SYNC] '" + tc.name
+            + "' finished in " + durationMs + "ms"
+            + " code=" + apiCode
+            + (errorMsg != null ? " error=" + errorMsg : ""));
+
+        // Build response
+        response.setStatus(200);
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        json.append("\"target\":\"").append(escapeJson(tc.name)).append("\"");
+        json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
+        json.append(",\"mode\":\"sync\"");
+        json.append(",\"durationMs\":").append(durationMs);
+
+        if (errorMsg != null) {
+            json.append(",\"status\":\"error\"");
+            json.append(",\"error\":\"").append(escapeJson(errorMsg)).append("\"");
+        } else {
+            json.append(",\"status\":\"ok\"");
+            json.append(",\"apiResponseCode\":").append(apiCode);
+            json.append(",\"data\":").append(
+                apiData != null ? apiData : "null");
+        }
+
+        json.append(",\"activeCalls\":").append(activeCallCount.get());
+        json.append(",\"timestamp\":\"").append(utcNow()).append("\"");
+        json.append("}");
+
+        out.print(json.toString());
+        out.flush();
+    }
+
+    // ========================================================================
+    // CACHED TARGET HANDLING (TeamViewer — slow API)
+    // ========================================================================
+
+    /**
+     * For slow APIs: start background call, wait up to N seconds for fresh
+     * result. If not ready, return last cached result.
+     * Background thread continues until API responds or total timeout.
+     */
+    private void handleCachedTarget(TargetConfig tc,
+                                    HttpServletResponse response,
+                                    PrintWriter out) {
+
+        String key = tc.name.toLowerCase();
+
+        // Ensure lock object exists for this target
+        inProgressLocks.putIfAbsent(key, new Object());
+        Object lock = inProgressLocks.get(key);
+
+        // Start background call if not already running
+        boolean startedNew = false;
+        synchronized (lock) {
+            Boolean running = inProgress.get(key);
+            if (running == null || !running) {
+                inProgress.put(key, Boolean.TRUE);
+                startedNew = true;
+                bgExecutor.submit(
+                    new BackgroundApiCaller(tc, key, lock));
+            }
+        }
+
+        // Wait up to cacheWaitSec for fresh result
+        if (startedNew) {
+            long waitUntil = System.currentTimeMillis()
+                + (tc.cacheWaitSec * 1000L);
+
+            synchronized (lock) {
+                while (Boolean.TRUE.equals(inProgress.get(key))
+                       && System.currentTimeMillis() < waitUntil) {
+                    try {
+                        long remaining = waitUntil - System.currentTimeMillis();
+                        if (remaining > 0) {
+                            lock.wait(remaining);
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Build response from cache
+        CachedResult cr = cache.get(key);
+        boolean bgRunning;
+        synchronized (lock) {
+            bgRunning = Boolean.TRUE.equals(inProgress.get(key));
+        }
+
+        response.setStatus(200);
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        json.append("\"target\":\"").append(escapeJson(tc.name)).append("\"");
+        json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
+        json.append(",\"mode\":\"cached\"");
+        json.append(",\"bgRunning\":").append(bgRunning);
+
+        if (cr == null) {
+            json.append(",\"status\":\"no_data_yet\"");
+            json.append(",\"message\":\"First call in progress, "
+                + "no cached result available\"");
+        } else {
+            long ageSeconds =
+                (System.currentTimeMillis() - cr.timestamp) / 1000;
+            boolean isFresh = (ageSeconds < 30);
+
+            json.append(",\"status\":\"")
+                .append(isFresh ? "fresh" : "cached").append("\"");
+            json.append(",\"ageSeconds\":").append(ageSeconds);
+            json.append(",\"lastUpdate\":\"")
+                .append(formatTimestamp(cr.timestamp)).append("\"");
+            json.append(",\"lastDurationMs\":").append(cr.durationMs);
+
+            if (cr.errorMsg != null) {
+                json.append(",\"lastError\":\"")
+                    .append(escapeJson(cr.errorMsg)).append("\"");
+            } else {
+                json.append(",\"apiResponseCode\":").append(cr.httpCode);
+                json.append(",\"data\":").append(
+                    cr.data != null ? cr.data : "null");
+            }
+        }
+
+        json.append(",\"activeCalls\":").append(activeCallCount.get());
+        json.append(",\"timestamp\":\"").append(utcNow()).append("\"");
+        json.append("}");
+
+        out.print(json.toString());
+        out.flush();
+    }
+
+    // ========================================================================
+    // BACKGROUND API CALLER (for cached subtypes)
+    // ========================================================================
+
+    /**
+     * Runs in the background thread pool.
+     * Calls the slow API, updates cache when done, notifies waiting thread.
+     */
+    private class BackgroundApiCaller implements Runnable {
+        private final TargetConfig tc;
+        private final String cacheKey;
+        private final Object lock;
+
+        BackgroundApiCaller(TargetConfig tc, String cacheKey, Object lock) {
+            this.tc = tc;
+            this.cacheKey = cacheKey;
+            this.lock = lock;
+        }
+
+        @Override
+        public void run() {
+            int active = activeCallCount.incrementAndGet();
+            long startTime = System.currentTimeMillis();
+
+            consoleLog("ApiCheckServlet: [CACHED-BG] '" + tc.name
+                + "' background call started (active: " + active + ")");
+
+            HttpURLConnection conn = null;
+            int apiCode = 0;
+            String apiData = null;
+            String errorMsg = null;
+
+            try {
+                URL url = new URL(tc.apiUrl);
+                conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod(tc.httpMethod);
+                conn.setConnectTimeout(tc.connectTimeoutMs);
+                conn.setReadTimeout(tc.bgTimeoutSec * 1000);
+
+                if (tc.authHeader != null && tc.authHeader.length() > 0) {
+                    conn.setRequestProperty("Authorization", tc.authHeader);
+                }
+                conn.setRequestProperty("Accept", "application/json");
+
+                if (tc.customHeaders != null) {
+                    for (Map.Entry<String, String> h
+                            : tc.customHeaders.entrySet()) {
+                        conn.setRequestProperty(h.getKey(), h.getValue());
+                    }
+                }
+
+                apiCode = conn.getResponseCode();
+                apiData = readStream(
+                    (apiCode >= 200 && apiCode < 300)
+                        ? conn.getInputStream() : conn.getErrorStream());
+
+            } catch (java.net.SocketTimeoutException e) {
+                errorMsg = "timeout: " + e.getMessage();
+            } catch (java.net.ConnectException e) {
+                errorMsg = "connection_refused: " + e.getMessage();
+            } catch (IOException e) {
+                errorMsg = "io_error: " + e.getMessage();
+            } catch (Exception e) {
+                errorMsg = e.getClass().getSimpleName()
+                    + ": " + e.getMessage();
+            } finally {
+                if (conn != null) {
+                    conn.disconnect();
+                }
+                activeCallCount.decrementAndGet();
+            }
+
+            long durationMs = System.currentTimeMillis() - startTime;
+
+            // Update cache
+            CachedResult cr = new CachedResult();
+            cr.httpCode   = apiCode;
+            cr.data       = apiData;
+            cr.errorMsg   = errorMsg;
+            cr.durationMs = durationMs;
+            cr.timestamp  = System.currentTimeMillis();
+            cache.put(cacheKey, cr);
+
+            // Log
+            logCallAsync(tc.name, tc.subType, tc.apiUrl, apiCode,
+                durationMs, errorMsg, "CACHED-BG");
+
+            consoleLog("ApiCheckServlet: [CACHED-BG] '" + tc.name
+                + "' finished in " + durationMs + "ms"
+                + " code=" + apiCode
+                + (errorMsg != null ? " error=" + errorMsg : ""));
+
+            // Signal waiting servlet thread
+            synchronized (lock) {
+                inProgress.put(cacheKey, Boolean.FALSE);
+                lock.notifyAll();
+            }
+        }
+    }
+
+    // ========================================================================
+    // STATUS & RELOAD ACTIONS
+    // ========================================================================
+
+    private void handleStatus(HttpServletResponse response, PrintWriter out) {
+        response.setStatus(200);
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        json.append("\"servletUpSince\":\"")
+            .append(formatTimestamp(initTimestamp)).append("\"");
+        json.append(",\"uptimeMinutes\":")
+            .append((System.currentTimeMillis() - initTimestamp) / 60_000);
+        json.append(",\"activeCalls\":").append(activeCallCount.get());
+        json.append(",\"configuredTargets\":").append(targets.size());
+        json.append(",\"maxBgThreads\":").append(MAX_BG_THREADS);
+
+        // Per-target cache status
+        json.append(",\"targets\":[");
+        boolean first = true;
+        for (Map.Entry<String, TargetConfig> entry : targets.entrySet()) {
+            if (!first) json.append(",");
+            first = false;
+            TargetConfig tc = entry.getValue();
+            CachedResult cr = cache.get(entry.getKey());
+            Boolean running = inProgress.get(entry.getKey());
+
+            json.append("{\"name\":\"").append(escapeJson(tc.name)).append("\"");
+            json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
+            json.append(",\"mode\":\"")
+                .append(tc.useCachedMode ? "cached" : "sync").append("\"");
+            json.append(",\"bgRunning\":").append(
+                Boolean.TRUE.equals(running));
+            if (cr != null) {
+                long age = (System.currentTimeMillis() - cr.timestamp) / 1000;
+                json.append(",\"lastUpdate\":\"")
+                    .append(formatTimestamp(cr.timestamp)).append("\"");
+                json.append(",\"ageSeconds\":").append(age);
+                json.append(",\"lastCode\":").append(cr.httpCode);
+                json.append(",\"lastDurationMs\":").append(cr.durationMs);
+                if (cr.errorMsg != null) {
+                    json.append(",\"lastError\":\"")
+                        .append(escapeJson(cr.errorMsg)).append("\"");
+                }
+            } else {
+                json.append(",\"lastUpdate\":\"never\"");
+            }
+            json.append("}");
+        }
+        json.append("]");
+        json.append("}");
+
+        out.print(json.toString());
+        out.flush();
+    }
+
+    private void handleReload(HttpServletResponse response, PrintWriter out) {
+        consoleLog("ApiCheckServlet: Reloading configuration...");
+        int count = reloadConfig();
+        consoleLog("ApiCheckServlet: Reloaded " + count + " targets.");
+
+        response.setStatus(200);
+        out.print("{\"status\":\"ok\",\"targetsLoaded\":" + count + "}");
+        out.flush();
+    }
+
+    // ========================================================================
+    // CONFIG LOADER — reads from servletconfig.nsf
+    // ========================================================================
+
+    private int reloadConfig() {
+        Map<String, TargetConfig> newTargets = new ConcurrentHashMap<>();
+
+        lotus.domino.Session session = null;
+        lotus.domino.Database db = null;
+        lotus.domino.View view = null;
+
+        try {
+           // NotesThread.sinitThread();
+            session = lotus.domino.NotesFactory.createSession();
+            db = session.getDatabase(DOMINO_SERVER, CONFIG_DB, false);
+
+            if (db == null || !db.isOpen()) {
+                consoleLog("ApiCheckServlet: ERROR — Cannot open " + CONFIG_DB);
+                return 0;
+            }
+
+            view = db.getView("vwActiveTargets");
+            if (view == null) {
+                consoleLog("ApiCheckServlet: ERROR — View 'vwActiveTargets' "
+                    + "not found in " + CONFIG_DB);
+                return 0;
+            }
+
+            view.setAutoUpdate(false);
+            lotus.domino.Document doc = view.getFirstDocument();
+
+            while (doc != null) {
+                try {
+                    TargetConfig tc = new TargetConfig();
+                    tc.name          = getItemString(doc, "TargetName");
+                    tc.subType       = getItemString(doc, "SubType");
+                    tc.apiUrl        = getItemString(doc, "ApiUrl");
+                    tc.httpMethod    = getItemString(doc, "HttpMethod");
+                    tc.authHeader    = getItemString(doc, "AuthHeader");
+
+                    if (tc.httpMethod == null || tc.httpMethod.length() == 0) {
+                        tc.httpMethod = "GET";
+                    }
+
+                    // Timeouts
+                    tc.connectTimeoutMs = getItemInt(doc,
+                        "ConnectTimeoutMs", DEFAULT_CONNECT_TIMEOUT_MS);
+                    tc.readTimeoutSec = getItemInt(doc,
+                        "ReadTimeoutSec", DEFAULT_SYNC_TIMEOUT_SEC);
+                    tc.cacheWaitSec = getItemInt(doc,
+                        "CacheWaitSec", DEFAULT_CACHE_WAIT_SEC);
+                    tc.bgTimeoutSec = getItemInt(doc,
+                        "BgTimeoutSec", DEFAULT_BG_TIMEOUT_SEC);
+
+                    // Cached mode — from config or auto-detect by subtype
+                    String cachedFlag = getItemString(doc, "UseCachedMode");
+                    if ("1".equals(cachedFlag) || "Yes".equalsIgnoreCase(cachedFlag)) {
+                        tc.useCachedMode = true;
+                    } else if ("0".equals(cachedFlag) || "No".equalsIgnoreCase(cachedFlag)) {
+                        tc.useCachedMode = false;
+                    } else {
+                        // Auto: TeamViewer uses cached mode by default
+                        tc.useCachedMode =
+                            "TeamViewer".equalsIgnoreCase(tc.subType);
+                    }
+
+                    // Custom headers (multi-value field: "Header-Name: value")
+                    java.util.Vector<?> headers =
+                        doc.getItemValue("CustomHeaders");
+                    if (headers != null && headers.size() > 0) {
+                        tc.customHeaders = new java.util.LinkedHashMap<>();
+                        for (Object h : headers) {
+                            String hs = h.toString().trim();
+                            int colon = hs.indexOf(':');
+                            if (colon > 0) {
+                                tc.customHeaders.put(
+                                    hs.substring(0, colon).trim(),
+                                    hs.substring(colon + 1).trim());
+                            }
+                        }
+                    }
+
+                    if (tc.name != null && tc.name.length() > 0
+                            && tc.apiUrl != null && tc.apiUrl.length() > 0) {
+                        newTargets.put(tc.name.toLowerCase(), tc);
+                        consoleLog("ApiCheckServlet: Loaded target '"
+                            + tc.name + "' [" + tc.subType + "] "
+                            + (tc.useCachedMode ? "CACHED" : "SYNC"));
+                    }
+
+                } catch (Exception e) {
+                    consoleLog("ApiCheckServlet: Error reading config doc: "
+                        + e.getMessage());
+                }
+
+                lotus.domino.Document next = view.getNextDocument(doc);
+                doc.recycle();
+                doc = next;
+            }
+        } catch (lotus.domino.NotesException ne) {
+            consoleLog("ApiCheckServlet: ERROR loading config: "
+                + ne.getMessage());
+        } catch (Exception e) {
+            consoleLog("ApiCheckServlet: ERROR loading config: "
+                + e.getMessage());
+        } finally {
+            recycleQuietly(view);
+            recycleQuietly(db);
+            recycleQuietly(session);
+        }
+
+        targets = newTargets;
+        return newTargets.size();
+    }
+
+    // ========================================================================
+    // LOGGER — writes to servletlog.nsf (async to not block response)
+    // ========================================================================
+
+    private void logCallAsync(final String targetName,
+                              final String subType,
+                              final String apiUrl,
+                              final int httpCode,
+                              final long durationMs,
+                              final String errorMsg,
+                              final String mode) {
+        bgExecutor.submit(new Runnable() {
+            @Override
+            public void run() {
+                logCall(targetName, subType, apiUrl,
+                    httpCode, durationMs, errorMsg, mode);
+            }
+        });
+    }
+
+    private void logCall(String targetName, String subType,
+                         String apiUrl, int httpCode,
+                         long durationMs, String errorMsg,
+                         String mode) {
+        lotus.domino.Session session = null;
+        lotus.domino.Database db = null;
+        lotus.domino.Document doc = null;
+
+        try {
+            session = lotus.domino.NotesFactory.createSession();
+            db = session.getDatabase(DOMINO_SERVER, LOG_DB, false);
+
+            if (db == null || !db.isOpen()) {
+                consoleLog("ApiCheckServlet: WARNING — Cannot open "
+                    + LOG_DB + " for logging");
+                return;
+            }
+
+            doc = db.createDocument();
+            doc.replaceItemValue("Form", "ApiCallLog");
+            doc.replaceItemValue("TargetName", targetName);
+            doc.replaceItemValue("SubType", subType);
+            doc.replaceItemValue("ApiUrl", apiUrl);
+            doc.replaceItemValue("HttpCode", httpCode);
+            doc.replaceItemValue("DurationMs", durationMs);
+            doc.replaceItemValue("Mode", mode);
+            doc.replaceItemValue("ActiveCalls", activeCallCount.get());
+            doc.replaceItemValue("CallTimestamp",
+                session.createDateTime(new Date()));
+
+            if (errorMsg != null) {
+                doc.replaceItemValue("ErrorMsg", errorMsg);
+                doc.replaceItemValue("Success", "0");
+            } else {
+                doc.replaceItemValue("ErrorMsg", "");
+                doc.replaceItemValue("Success", "1");
+            }
+
+            doc.save(true, false);
+
+        } catch (Exception e) {
+            consoleLog("ApiCheckServlet: WARNING — Log write failed: "
+                + e.getMessage());
+        } finally {
+            recycleQuietly(doc);
+            recycleQuietly(db);
+            recycleQuietly(session);
+        }
+    }
+
+    // ========================================================================
+    // UTILITY METHODS
+    // ========================================================================
+
+    /** Log to Domino server console */
+    private static void consoleLog(String msg) {
+        System.out.println(msg);
+    }
+
+    /** Read an InputStream to String */
+    private static String readStream(InputStream is) throws IOException {
+        if (is == null) return null;
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(is, "UTF-8"))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Safe JSON string escape */
+    private static String escapeJson(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
+    }
+
+    /** Format timestamp to ISO 8601 UTC */
+    private static String formatTimestamp(long ts) {
+        if (ts == 0) return "never";
+        SimpleDateFormat sdf =
+            new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'");
+        sdf.setTimeZone(TimeZone.getTimeZone("UTC"));
+        return sdf.format(new Date(ts));
+    }
+
+    /** Current UTC timestamp as ISO string */
+    private static String utcNow() {
+        return formatTimestamp(System.currentTimeMillis());
+    }
+
+    /** Get string item from Notes document, null-safe */
+    private static String getItemString(lotus.domino.Document doc,
+                                        String itemName) {
+        try {
+            String val = doc.getItemValueString(itemName);
+            return (val != null && val.length() > 0) ? val.trim() : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Get integer item from Notes document with default */
+    private static int getItemInt(lotus.domino.Document doc,
+                                  String itemName, int defaultVal) {
+        try {
+            String val = doc.getItemValueString(itemName);
+            if (val != null && val.length() > 0) {
+                return Integer.parseInt(val.trim());
+            }
+        } catch (Exception e) {
+            // ignore parse errors
+        }
+        return defaultVal;
+    }
+
+    /** Build JSON array of target names */
+    private String targetListJson() {
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        for (TargetConfig tc : targets.values()) {
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("\"").append(escapeJson(tc.name)).append("\"");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    /** Safe recycle for Domino objects */
+    private static void recycleQuietly(lotus.domino.Base obj) {
+        if (obj != null) {
+            try { obj.recycle(); } catch (Exception e) { /* ignore */ }
+        }
+    }
+}
