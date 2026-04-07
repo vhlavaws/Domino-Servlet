@@ -5,8 +5,9 @@ servletconfig.json
 lib/
 xxlib/
 
-# Also ignore compiled class files and VS Code internal state
+# Also ignore compiled class files, builded jar file and VS Code internal state
 bin/
+build/
 
 *.class
 .vscode/

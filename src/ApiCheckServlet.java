@@ -59,11 +59,11 @@ public class ApiCheckServlet extends HttpServlet {
     private static final int MAX_BG_THREADS = 15;
 
     /** Domino server name for NotesFactory (empty = local) */
-    private static final String DOMINO_SERVER = "";
+    private static final String DOMINO_SERVER = "Django";
 
     /** Config database filename */
     //private static final String CONFIG_DB = "whitesoft/servletconfig.nsf";
-    private static final String CONFIG_DB = "whitesoft/noteslog.nsf";
+    private static final String CONFIG_DB = "users/vh/dev/assitant_bot_service.nsf";
     /** Log database filename */
     //private static final String LOG_DB = "whitesoft/servletlog.nsf";
     private static final String LOG_DB = "whitesoft/noteslog.nsf";
@@ -118,7 +118,7 @@ public class ApiCheckServlet extends HttpServlet {
 
         // Load configurations from Domino DB
         consoleLog("ApiCheckServlet: Initializing...");
-// TODO reloadConfig();
+        reloadConfig();
         consoleLog("ApiCheckServlet: Initialized with "
             + targets.size() + " targets.");
     }
@@ -145,8 +145,14 @@ public class ApiCheckServlet extends HttpServlet {
     
         PrintWriter out = response.getWriter();
 
-        // --- Auth check ---
+         // --- Log API Request ---
         String keyParam = request.getParameter("key");
+        String action = request.getParameter("action");
+        String targetName = request.getParameter("target");
+        consoleLog("ApiCheckServlet: Calling with key=" + keyParam + ", action=" + action + ", target=" + targetName);
+
+
+        // --- Auth check ---
         if (keyParam == null || !keyParam.equals(secretKey)) {
             response.setStatus(403);
             out.print("{\"error\":\"unauthorized\"}");
@@ -155,7 +161,6 @@ public class ApiCheckServlet extends HttpServlet {
         }
 
         // --- Action routing ---
-        String action = request.getParameter("action");
         if ("status".equals(action)) {
             handleStatus(response, out);
             return;
@@ -165,8 +170,7 @@ public class ApiCheckServlet extends HttpServlet {
             return;
         }
 
-        // --- Target check ---
-        String targetName = request.getParameter("target");
+        // --- Target check ---  
         if (targetName == null || targetName.length() == 0) {
             response.setStatus(400);
             out.print("{\"error\":\"missing 'target' parameter\"}");
@@ -582,9 +586,9 @@ public class ApiCheckServlet extends HttpServlet {
                 return 0;
             }
 
-            view = db.getView("vwActiveTargets");
+            view = db.getView("($APIChecksActiveTargets)");
             if (view == null) {
-                consoleLog("ApiCheckServlet: ERROR — View 'vwActiveTargets' "
+                consoleLog("ApiCheckServlet: ERROR — View '($APIChecksActiveTargets)' "
                     + "not found in " + CONFIG_DB);
                 return 0;
             }
