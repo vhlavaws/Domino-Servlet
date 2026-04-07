@@ -58,15 +58,17 @@ public class ApiCheckServlet extends HttpServlet {
     /** Max background threads for async API calls */
     private static final int MAX_BG_THREADS = 15;
 
+    /** Secret key for access control */
+    private static String secretKey = "SECRET";
+
     /** Domino server name for NotesFactory (empty = local) */
-    private static final String DOMINO_SERVER = "Django";
+    private static String dominoServer = "Django";
 
     /** Config database filename */
-    //private static final String CONFIG_DB = "whitesoft/servletconfig.nsf";
-    private static final String CONFIG_DB = "users/vh/dev/assitant_bot_service.nsf";
+    private static String configDb = "tools/servlets_config.nsf";
+    
     /** Log database filename */
-    //private static final String LOG_DB = "whitesoft/servletlog.nsf";
-    private static final String LOG_DB = "whitesoft/noteslog.nsf";
+    private static String logDb = "tools/servlets_config.nsf";
 
     // ========================================================================
     // SHARED STATE
@@ -92,8 +94,7 @@ public class ApiCheckServlet extends HttpServlet {
     /** Thread pool for background API calls */
     private static ExecutorService bgExecutor;
 
-    /** Secret key for access control */
-    private static String secretKey = "SECRET";
+
 
     /** Servlet initialization timestamp */
     private static long initTimestamp = 0;
@@ -112,6 +113,22 @@ public class ApiCheckServlet extends HttpServlet {
         if (keyParam != null && keyParam.length() > 0) {
             secretKey = keyParam;
         }
+
+        String dbParam = config.getInitParameter("configDbPath");
+        if (dbParam != null && dbParam.length() > 0) {
+            configDb = dbParam;
+        }
+
+        dbParam = config.getInitParameter("logDbPath");
+        if (dbParam != null && dbParam.length() > 0) {
+            logDb = dbParam;
+        }
+
+        String serverParam = config.getInitParameter("dominoServer");
+        if (serverParam != null && serverParam.length() > 0) {
+            dominoServer = serverParam;
+        }
+
 
         // Create bounded thread pool
         bgExecutor = Executors.newFixedThreadPool(MAX_BG_THREADS);
@@ -169,6 +186,7 @@ public class ApiCheckServlet extends HttpServlet {
             handleReload(response, out);
             return;
         }
+         
 
         // --- Target check ---  
         if (targetName == null || targetName.length() == 0) {
@@ -577,19 +595,19 @@ public class ApiCheckServlet extends HttpServlet {
         lotus.domino.View view = null;
 
         try {
-           // NotesThread.sinitThread();
+            NotesThread.sinitThread();
             session = lotus.domino.NotesFactory.createSession();
-            db = session.getDatabase(DOMINO_SERVER, CONFIG_DB, false);
+            db = session.getDatabase(dominoServer, configDb, false);
 
             if (db == null || !db.isOpen()) {
-                consoleLog("ApiCheckServlet: ERROR — Cannot open " + CONFIG_DB);
+                consoleLog("ApiCheckServlet: ERROR — Cannot open " + configDb);
                 return 0;
             }
 
             view = db.getView("($APIChecksActiveTargets)");
             if (view == null) {
                 consoleLog("ApiCheckServlet: ERROR — View '($APIChecksActiveTargets)' "
-                    + "not found in " + CONFIG_DB);
+                    + "not found in " + configDb);
                 return 0;
             }
 
@@ -623,12 +641,8 @@ public class ApiCheckServlet extends HttpServlet {
                     String cachedFlag = getItemString(doc, "UseCachedMode");
                     if ("1".equals(cachedFlag) || "Yes".equalsIgnoreCase(cachedFlag)) {
                         tc.useCachedMode = true;
-                    } else if ("0".equals(cachedFlag) || "No".equalsIgnoreCase(cachedFlag)) {
-                        tc.useCachedMode = false;
                     } else {
-                        // Auto: TeamViewer uses cached mode by default
-                        tc.useCachedMode =
-                            "TeamViewer".equalsIgnoreCase(tc.subType);
+                        tc.useCachedMode = false;
                     }
 
                     // Custom headers (multi-value field: "Header-Name: value")
@@ -709,12 +723,13 @@ public class ApiCheckServlet extends HttpServlet {
         lotus.domino.Document doc = null;
 
         try {
+            NotesThread.sinitThread();
             session = lotus.domino.NotesFactory.createSession();
-            db = session.getDatabase(DOMINO_SERVER, LOG_DB, false);
+            db = session.getDatabase(dominoServer, logDb, false);
 
             if (db == null || !db.isOpen()) {
                 consoleLog("ApiCheckServlet: WARNING — Cannot open "
-                    + LOG_DB + " for logging");
+                    + logDb + " for logging");
                 return;
             }
 
