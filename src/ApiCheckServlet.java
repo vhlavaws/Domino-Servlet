@@ -5,6 +5,8 @@ import javax.servlet.http.HttpServletResponse;
 import lotus.domino.NotesThread;
 
 import javax.servlet.ServletException;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
 import javax.servlet.ServletConfig;
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -25,15 +27,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * ApiCheckServlet — Multi-target API monitoring servlet for HCL Domino.
  *
- * Reads target configuration from servletconfig.nsf,
- * logs calls to servletlog.nsf, supports per-subtype behavior:
- *   - "TeamViewer" subtype: cached/async (returns last known result if API is slow)
- *   - All other subtypes: synchronous (waits for actual response or timeout)
+ * Reads target configuration from servletconfig.nsf, logs calls to servletlog.nsf, supports
+ * per-subtype behavior: - "TeamViewer" subtype: cached/async (returns last known result if API is
+ * slow) - All other subtypes: synchronous (waits for actual response or timeout)
  *
- * URL pattern:
- *   /servlet/ApiCheck?target=<name>&key=<secret>
- *   /servlet/ApiCheck?action=status&key=<secret>     — show active calls and cache
- *   /servlet/ApiCheck?action=reload&key=<secret>     — reload config from DB
+ * URL pattern: /servlet/ApiCheck?target=<name>&key=<secret>
+ * /servlet/ApiCheck?action=status&key=<secret> — show active calls and cache
+ * /servlet/ApiCheck?action=reload&key=<secret> — reload config from DB
  *
  * Deployment: see DEPLOYMENT.md
  */
@@ -49,8 +49,8 @@ public class ApiCheckServlet extends HttpServlet {
     /** Default total seconds for background thread on cached subtypes */
     private static final int DEFAULT_BG_TIMEOUT_SEC = 80;
 
-    /** Default connect timeout in milliseconds */
-    private static final int DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+    /** Default connect timeout in seconds */
+    private static final int DEFAULT_CONNECT_TIMEOUT_SEC = 60;
 
     /** Default read timeout for synchronous subtypes (seconds) */
     private static final int DEFAULT_SYNC_TIMEOUT_SEC = 60;
@@ -66,7 +66,7 @@ public class ApiCheckServlet extends HttpServlet {
 
     /** Config database filename */
     private static String configDb = "tools/servlets_config.nsf";
-    
+
     /** Log database filename */
     private static String logDb = "tools/servlets_config.nsf";
 
@@ -75,26 +75,20 @@ public class ApiCheckServlet extends HttpServlet {
     // ========================================================================
 
     /** Target configurations loaded from servletconfig.nsf */
-    private static volatile Map<String, TargetConfig> targets
-        = new ConcurrentHashMap<>();
+    private static volatile Map<String, TargetConfig> targets = new ConcurrentHashMap<>();
 
     /** Per-target cached results */
-    private static final ConcurrentHashMap<String, CachedResult> cache
-        = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, CachedResult> cache = new ConcurrentHashMap<>();
 
     /** Per-target "call in progress" flags */
-    private static final ConcurrentHashMap<String, Object> inProgressLocks
-        = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<String, Boolean> inProgress
-        = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Object> inProgressLocks = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Boolean> inProgress = new ConcurrentHashMap<>();
 
     /** Global active call counter */
     private static final AtomicInteger activeCallCount = new AtomicInteger(0);
 
     /** Thread pool for background API calls */
     private static ExecutorService bgExecutor;
-
-
 
     /** Servlet initialization timestamp */
     private static long initTimestamp = 0;
@@ -108,12 +102,12 @@ public class ApiCheckServlet extends HttpServlet {
         super.init(config);
 
         // Log Java environment info on startup
-        String version = System.getProperty("java.version");          // e.g., "1.8.0_202"
-        String vendor  = System.getProperty("java.vendor");           // e.g., "IBM Corporation"
-        String spec    = System.getProperty("java.specification.version"); // e.g., "1.8"
-        String vmName  = System.getProperty("java.vm.name");          // e.g., "IBM J9 VM"
-        consoleLog("ApiCheckServlet: Starting up with Java "
-            + version + " (" + vendor + ", " + vmName + ", spec " + spec + ")");    
+        String version = System.getProperty("java.version"); // e.g., "1.8.0_202"
+        String vendor = System.getProperty("java.vendor"); // e.g., "IBM Corporation"
+        String spec = System.getProperty("java.specification.version"); // e.g., "1.8"
+        String vmName = System.getProperty("java.vm.name"); // e.g., "IBM J9 VM"
+        consoleLog("ApiCheckServlet: Starting up with Java " + version + " (" + vendor + ", " + vmName + ", spec "
+                + spec + ")");
 
         initTimestamp = System.currentTimeMillis();
 
@@ -138,15 +132,13 @@ public class ApiCheckServlet extends HttpServlet {
             dominoServer = serverParam;
         }
 
-
         // Create bounded thread pool
         bgExecutor = Executors.newFixedThreadPool(MAX_BG_THREADS);
 
         // Load configurations from Domino DB
         consoleLog("ApiCheckServlet: Initializing...");
         reloadConfig();
-        consoleLog("ApiCheckServlet: Initialized with "
-            + targets.size() + " targets.");
+        consoleLog("ApiCheckServlet: Initialized with " + targets.size() + " targets.");
     }
 
     @Override
@@ -163,20 +155,17 @@ public class ApiCheckServlet extends HttpServlet {
     // ========================================================================
 
     @Override
-    public void doGet(HttpServletRequest request,
-                      HttpServletResponse response)
-            throws ServletException, IOException {
+    public void doGet(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
 
         response.setContentType("application/json; charset=UTF-8");
-    
+
         PrintWriter out = response.getWriter();
 
-         // --- Log API Request ---
+        // --- Log API Request ---
         String keyParam = request.getParameter("key");
         String action = request.getParameter("action");
         String targetName = request.getParameter("target");
         consoleLog("ApiCheckServlet: Calling with key=" + keyParam + ", action=" + action + ", target=" + targetName);
-
 
         // --- Auth check ---
         if (keyParam == null || !keyParam.equals(secretKey)) {
@@ -195,9 +184,8 @@ public class ApiCheckServlet extends HttpServlet {
             handleReload(response, out);
             return;
         }
-         
 
-        // --- Target check ---  
+        // --- Target check ---
         if (targetName == null || targetName.length() == 0) {
             response.setStatus(400);
             out.print("{\"error\":\"missing 'target' parameter\"}");
@@ -208,19 +196,19 @@ public class ApiCheckServlet extends HttpServlet {
         TargetConfig tc = targets.get(targetName.toLowerCase());
         if (tc == null) {
             response.setStatus(404);
-            out.print("{\"error\":\"unknown target: " + escapeJson(targetName)
-                + "\", \"availableTargets\":" + targetListJson() + "}");
+            out.print("{\"error\":\"unknown target: " + escapeJson(targetName) + "\", \"availableTargets\":"
+                    + targetListJson() + "}");
             out.flush();
             return;
         }
 
         // --- Dispatch based on subtype ---
-        consoleLog("ApiCheckServlet: [" + tc.subType + "] "
-            + "Checking target '" + tc.name + "' -> " + tc.apiUrl);
+        consoleLog("ApiCheckServlet: [" + tc.subType + "] " + "Checking target '" + tc.name + "' -> " + tc.apiUrl);
 
         if (tc.useCachedMode) {
             handleCachedTarget(tc, response, out);
-        } else {
+        }
+        else {
             handleSyncTarget(tc, response, out);
         }
     }
@@ -228,20 +216,16 @@ public class ApiCheckServlet extends HttpServlet {
     // ========================================================================
     // SYNCHRONOUS TARGET HANDLING (Viber, ProfiSMS, Sametime, etc.)
     // ========================================================================
-
     /**
-     * Calls the API synchronously — waits for response or timeout.
-     * Returns the actual live result to the monitoring app.
+     * Calls the API synchronously — waits for response or timeout. Returns the actual live result to
+     * the monitoring app.
      */
-    private void handleSyncTarget(TargetConfig tc,
-                                  HttpServletResponse response,
-                                  PrintWriter out) {
+    private void handleSyncTarget(TargetConfig tc, HttpServletResponse response, PrintWriter out) {
 
         int active = activeCallCount.incrementAndGet();
         long startTime = System.currentTimeMillis();
 
-        consoleLog("ApiCheckServlet: [SYNC] '" + tc.name
-            + "' started (active calls: " + active + ")");
+        consoleLog("ApiCheckServlet: [SYNC] '" + tc.name + "' started (active calls: " + active + ")");
 
         HttpURLConnection conn = null;
         int apiCode = 0;
@@ -251,30 +235,43 @@ public class ApiCheckServlet extends HttpServlet {
         try {
             URL url = new URL(tc.apiUrl);
             conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod(tc.httpMethod);
-            conn.setConnectTimeout(tc.connectTimeoutMs);
-            conn.setReadTimeout(tc.readTimeoutSec * 1000);
-            
-            // Set headers
-            if (tc.authHeader != null && tc.authHeader.length() > 0) {
-                conn.setRequestProperty("Authorization", tc.authHeader);
-            }
-            conn.setRequestProperty("Accept", "application/json");
 
-            // Add custom headers from config
-            
-            if (tc.customHeaders != null) {
-                for (Map.Entry<String, String> h : tc.customHeaders.entrySet()) {
-                    conn.setRequestProperty(h.getKey(), h.getValue());
-                }
+            if (conn instanceof HttpsURLConnection) {
+                SSLContext sc = SSLContext.getInstance("TLSv1.2");
+                sc.init(null, null, new java.security.SecureRandom());
+                ((HttpsURLConnection) conn).setSSLSocketFactory(sc.getSocketFactory());
+                consoleLog("ApiCheckServlet: [SYNC] '" + tc.name + "' using HTTPS with TLSv1.2");
             }
-            
+            setRequestProperties(conn, tc);
             apiCode = conn.getResponseCode();
-            apiData = readStream(
-                (apiCode >= 200 && apiCode < 300)
-                    ? conn.getInputStream() : conn.getErrorStream());
+            // Handle HTTP redirects manually to preserve headers (for http->https case)
+            if (apiCode == HttpURLConnection.HTTP_MOVED_TEMP || apiCode == HttpURLConnection.HTTP_MOVED_PERM
+                    || apiCode == 307 || apiCode == 308) {
 
-            consoleLog("ApiCheckServlet: [SYNC] read response after timeout: " + tc.connectTimeoutMs + " ms, API code: " + apiCode + ", data length: " + (apiData != null ? apiData.length() : "null"));
+                // S Get new location
+                String newUrl = conn.getHeaderField("Location");
+                consoleLog("Redirected to: " + newUrl);
+
+                // Step 3: Close current and open new
+                conn.disconnect();
+
+                URL next = new URL(newUrl);
+                conn = (HttpURLConnection) next.openConnection();
+
+                if (conn instanceof HttpsURLConnection) {
+                    SSLContext sc = SSLContext.getInstance("TLSv1.2");
+                    sc.init(null, null, new java.security.SecureRandom());
+                    ((HttpsURLConnection) conn).setSSLSocketFactory(sc.getSocketFactory());
+                    consoleLog("ApiCheckServlet: [SYNC] '" + tc.name + "' using HTTPS with TLSv1.2 after redirect");
+                }
+                setRequestProperties(conn, tc);
+
+                apiCode = conn.getResponseCode();
+            }
+            apiData = readStream((apiCode >= 200 && apiCode < 300) ? conn.getInputStream() : conn.getErrorStream());
+
+            consoleLog("ApiCheckServlet: [SYNC] read response after timeout: " + tc.connectTimeoutSec
+                    + " sec, API code: " + apiCode + ", data length: " + (apiData != null ? apiData.length() : "null"));
 
         } catch (java.net.SocketTimeoutException e) {
             errorMsg = "timeout: " + e.getMessage();
@@ -294,13 +291,10 @@ public class ApiCheckServlet extends HttpServlet {
         long durationMs = System.currentTimeMillis() - startTime;
 
         // Log to a log database
-        logCallAsync(tc.name, tc.subType, tc.apiUrl, apiCode,
-            durationMs, errorMsg, "SYNC");
+        logCallAsync(tc.name, tc.subType, tc.apiUrl, apiCode, durationMs, errorMsg, "SYNC");
 
-        consoleLog("ApiCheckServlet: [SYNC] '" + tc.name
-            + "' finished in " + durationMs + "ms"
-            + " code=" + apiCode
-            + (errorMsg != null ? " error=" + errorMsg : ""));
+        consoleLog("ApiCheckServlet: [SYNC] '" + tc.name + "' finished in " + durationMs + "ms" + " code=" + apiCode
+                + (errorMsg != null ? " error=" + errorMsg : ""));
 
         // Build response
         response.setStatus(200);
@@ -314,11 +308,11 @@ public class ApiCheckServlet extends HttpServlet {
         if (errorMsg != null) {
             json.append(",\"status\":\"error\"");
             json.append(",\"error\":\"").append(escapeJson(errorMsg)).append("\"");
-        } else {
+        }
+        else {
             json.append(",\"status\":\"ok\"");
             json.append(",\"apiResponseCode\":").append(apiCode);
-            json.append(",\"data\":").append(
-                apiData != null ? apiData : "null");
+            json.append(",\"data\":").append(apiData != null ? apiData : "null");
         }
 
         json.append(",\"activeCalls\":").append(activeCallCount.get());
@@ -333,14 +327,32 @@ public class ApiCheckServlet extends HttpServlet {
     // CACHED TARGET HANDLING (TeamViewer — slow API)
     // ========================================================================
 
+    private void setRequestProperties(HttpURLConnection conn, TargetConfig tc) throws Exception {
+
+        // Set timeouts and method
+        conn.setRequestMethod(tc.httpMethod);
+        conn.setConnectTimeout(tc.connectTimeoutSec * 1000);
+        conn.setReadTimeout(tc.readTimeoutSec * 1000);
+
+        // Set headers
+        if (tc.authHeader != null && tc.authHeader.length() > 0) {
+            conn.setRequestProperty("Authorization", tc.authHeader);
+        }
+        conn.setRequestProperty("Accept", "application/json");
+
+        // Add custom headers from config
+        if (tc.customHeaders != null) {
+            for (Map.Entry<String, String> h : tc.customHeaders.entrySet()) {
+                conn.setRequestProperty(h.getKey(), h.getValue());
+            }
+        }
+    }
+
     /**
-     * For slow APIs: start background call, wait up to N seconds for fresh
-     * result. If not ready, return last cached result.
-     * Background thread continues until API responds or total timeout.
+     * For slow APIs: start background call, wait up to N seconds for fresh result. If not ready, return
+     * last cached result. Background thread continues until API responds or total timeout.
      */
-    private void handleCachedTarget(TargetConfig tc,
-                                    HttpServletResponse response,
-                                    PrintWriter out) {
+    private void handleCachedTarget(TargetConfig tc, HttpServletResponse response, PrintWriter out) {
 
         String key = tc.name.toLowerCase();
 
@@ -355,19 +367,16 @@ public class ApiCheckServlet extends HttpServlet {
             if (running == null || !running) {
                 inProgress.put(key, Boolean.TRUE);
                 startedNew = true;
-                bgExecutor.submit(
-                    new BackgroundApiCaller(tc, key, lock));
+                bgExecutor.submit(new BackgroundApiCaller(tc, key, lock));
             }
         }
 
         // Wait up to cacheWaitSec for fresh result
         if (startedNew) {
-            long waitUntil = System.currentTimeMillis()
-                + (tc.cacheWaitSec * 1000L);
+            long waitUntil = System.currentTimeMillis() + (tc.cacheWaitSec * 1000L);
 
             synchronized (lock) {
-                while (Boolean.TRUE.equals(inProgress.get(key))
-                       && System.currentTimeMillis() < waitUntil) {
+                while (Boolean.TRUE.equals(inProgress.get(key)) && System.currentTimeMillis() < waitUntil) {
                     try {
                         long remaining = waitUntil - System.currentTimeMillis();
                         if (remaining > 0) {
@@ -398,27 +407,23 @@ public class ApiCheckServlet extends HttpServlet {
 
         if (cr == null) {
             json.append(",\"status\":\"no_data_yet\"");
-            json.append(",\"message\":\"First call in progress, "
-                + "no cached result available\"");
-        } else {
-            long ageSeconds =
-                (System.currentTimeMillis() - cr.timestamp) / 1000;
+            json.append(",\"message\":\"First call in progress, " + "no cached result available\"");
+        }
+        else {
+            long ageSeconds = (System.currentTimeMillis() - cr.timestamp) / 1000;
             boolean isFresh = (ageSeconds < 30);
 
-            json.append(",\"status\":\"")
-                .append(isFresh ? "fresh" : "cached").append("\"");
+            json.append(",\"status\":\"").append(isFresh ? "fresh" : "cached").append("\"");
             json.append(",\"ageSeconds\":").append(ageSeconds);
-            json.append(",\"lastUpdate\":\"")
-                .append(formatTimestamp(cr.timestamp)).append("\"");
+            json.append(",\"lastUpdate\":\"").append(formatTimestamp(cr.timestamp)).append("\"");
             json.append(",\"lastDurationMs\":").append(cr.durationMs);
 
             if (cr.errorMsg != null) {
-                json.append(",\"lastError\":\"")
-                    .append(escapeJson(cr.errorMsg)).append("\"");
-            } else {
+                json.append(",\"lastError\":\"").append(escapeJson(cr.errorMsg)).append("\"");
+            }
+            else {
                 json.append(",\"apiResponseCode\":").append(cr.httpCode);
-                json.append(",\"data\":").append(
-                    cr.data != null ? cr.data : "null");
+                json.append(",\"data\":").append(cr.data != null ? cr.data : "null");
             }
         }
 
@@ -435,8 +440,8 @@ public class ApiCheckServlet extends HttpServlet {
     // ========================================================================
 
     /**
-     * Runs in the background thread pool.
-     * Calls the slow API, updates cache when done, notifies waiting thread.
+     * Runs in the background thread pool. Calls the slow API, updates cache when done, notifies waiting
+     * thread.
      */
     private class BackgroundApiCaller implements Runnable {
         private final TargetConfig tc;
@@ -454,8 +459,8 @@ public class ApiCheckServlet extends HttpServlet {
             int active = activeCallCount.incrementAndGet();
             long startTime = System.currentTimeMillis();
 
-            consoleLog("ApiCheckServlet: [CACHED-BG] '" + tc.name
-                + "' background call started (active: " + active + ")");
+            consoleLog(
+                    "ApiCheckServlet: [CACHED-BG] '" + tc.name + "' background call started (active: " + active + ")");
 
             HttpURLConnection conn = null;
             int apiCode = 0;
@@ -466,7 +471,7 @@ public class ApiCheckServlet extends HttpServlet {
                 URL url = new URL(tc.apiUrl);
                 conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod(tc.httpMethod);
-                conn.setConnectTimeout(tc.connectTimeoutMs);
+                conn.setConnectTimeout(tc.connectTimeoutSec * 1000);
                 conn.setReadTimeout(tc.bgTimeoutSec * 1000);
 
                 if (tc.authHeader != null && tc.authHeader.length() > 0) {
@@ -475,16 +480,13 @@ public class ApiCheckServlet extends HttpServlet {
                 conn.setRequestProperty("Accept", "application/json");
 
                 if (tc.customHeaders != null) {
-                    for (Map.Entry<String, String> h
-                            : tc.customHeaders.entrySet()) {
+                    for (Map.Entry<String, String> h : tc.customHeaders.entrySet()) {
                         conn.setRequestProperty(h.getKey(), h.getValue());
                     }
                 }
 
                 apiCode = conn.getResponseCode();
-                apiData = readStream(
-                    (apiCode >= 200 && apiCode < 300)
-                        ? conn.getInputStream() : conn.getErrorStream());
+                apiData = readStream((apiCode >= 200 && apiCode < 300) ? conn.getInputStream() : conn.getErrorStream());
 
             } catch (java.net.SocketTimeoutException e) {
                 errorMsg = "timeout: " + e.getMessage();
@@ -493,8 +495,7 @@ public class ApiCheckServlet extends HttpServlet {
             } catch (IOException e) {
                 errorMsg = "io_error: " + e.getMessage();
             } catch (Exception e) {
-                errorMsg = e.getClass().getSimpleName()
-                    + ": " + e.getMessage();
+                errorMsg = e.getClass().getSimpleName() + ": " + e.getMessage();
             } finally {
                 if (conn != null) {
                     conn.disconnect();
@@ -506,21 +507,18 @@ public class ApiCheckServlet extends HttpServlet {
 
             // Update cache
             CachedResult cr = new CachedResult();
-            cr.httpCode   = apiCode;
-            cr.data       = apiData;
-            cr.errorMsg   = errorMsg;
+            cr.httpCode = apiCode;
+            cr.data = apiData;
+            cr.errorMsg = errorMsg;
             cr.durationMs = durationMs;
-            cr.timestamp  = System.currentTimeMillis();
+            cr.timestamp = System.currentTimeMillis();
             cache.put(cacheKey, cr);
 
             // Log
-            logCallAsync(tc.name, tc.subType, tc.apiUrl, apiCode,
-                durationMs, errorMsg, "CACHED-BG");
+            logCallAsync(tc.name, tc.subType, tc.apiUrl, apiCode, durationMs, errorMsg, "CACHED-BG");
 
-            consoleLog("ApiCheckServlet: [CACHED-BG] '" + tc.name
-                + "' finished in " + durationMs + "ms"
-                + " code=" + apiCode
-                + (errorMsg != null ? " error=" + errorMsg : ""));
+            consoleLog("ApiCheckServlet: [CACHED-BG] '" + tc.name + "' finished in " + durationMs + "ms" + " code="
+                    + apiCode + (errorMsg != null ? " error=" + errorMsg : ""));
 
             // Signal waiting servlet thread
             synchronized (lock) {
@@ -538,10 +536,8 @@ public class ApiCheckServlet extends HttpServlet {
         response.setStatus(200);
         StringBuilder json = new StringBuilder();
         json.append("{");
-        json.append("\"servletUpSince\":\"")
-            .append(formatTimestamp(initTimestamp)).append("\"");
-        json.append(",\"uptimeMinutes\":")
-            .append((System.currentTimeMillis() - initTimestamp) / 60_000);
+        json.append("\"servletUpSince\":\"").append(formatTimestamp(initTimestamp)).append("\"");
+        json.append(",\"uptimeMinutes\":").append((System.currentTimeMillis() - initTimestamp) / 60_000);
         json.append(",\"activeCalls\":").append(activeCallCount.get());
         json.append(",\"configuredTargets\":").append(targets.size());
         json.append(",\"maxBgThreads\":").append(MAX_BG_THREADS);
@@ -550,7 +546,8 @@ public class ApiCheckServlet extends HttpServlet {
         json.append(",\"targets\":[");
         boolean first = true;
         for (Map.Entry<String, TargetConfig> entry : targets.entrySet()) {
-            if (!first) json.append(",");
+            if (!first)
+                json.append(",");
             first = false;
             TargetConfig tc = entry.getValue();
             CachedResult cr = cache.get(entry.getKey());
@@ -558,22 +555,19 @@ public class ApiCheckServlet extends HttpServlet {
 
             json.append("{\"name\":\"").append(escapeJson(tc.name)).append("\"");
             json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
-            json.append(",\"mode\":\"")
-                .append(tc.useCachedMode ? "cached" : "sync").append("\"");
-            json.append(",\"bgRunning\":").append(
-                Boolean.TRUE.equals(running));
+            json.append(",\"mode\":\"").append(tc.useCachedMode ? "cached" : "sync").append("\"");
+            json.append(",\"bgRunning\":").append(Boolean.TRUE.equals(running));
             if (cr != null) {
                 long age = (System.currentTimeMillis() - cr.timestamp) / 1000;
-                json.append(",\"lastUpdate\":\"")
-                    .append(formatTimestamp(cr.timestamp)).append("\"");
+                json.append(",\"lastUpdate\":\"").append(formatTimestamp(cr.timestamp)).append("\"");
                 json.append(",\"ageSeconds\":").append(age);
                 json.append(",\"lastCode\":").append(cr.httpCode);
                 json.append(",\"lastDurationMs\":").append(cr.durationMs);
                 if (cr.errorMsg != null) {
-                    json.append(",\"lastError\":\"")
-                        .append(escapeJson(cr.errorMsg)).append("\"");
+                    json.append(",\"lastError\":\"").append(escapeJson(cr.errorMsg)).append("\"");
                 }
-            } else {
+            }
+            else {
                 json.append(",\"lastUpdate\":\"never\"");
             }
             json.append("}");
@@ -618,8 +612,7 @@ public class ApiCheckServlet extends HttpServlet {
 
             view = db.getView("($APIChecksActiveTargets)");
             if (view == null) {
-                consoleLog("ApiCheckServlet: ERROR — View '($APIChecksActiveTargets)' "
-                    + "not found in " + configDb);
+                consoleLog("ApiCheckServlet: ERROR — View '($APIChecksActiveTargets)' " + "not found in " + configDb);
                 return 0;
             }
 
@@ -629,61 +622,52 @@ public class ApiCheckServlet extends HttpServlet {
             while (doc != null) {
                 try {
                     TargetConfig tc = new TargetConfig();
-                    tc.name          = getItemString(doc, "TargetName");
-                    tc.subType       = getItemString(doc, "SubType");
-                    tc.apiUrl        = getItemString(doc, "ApiUrl");
-                    tc.httpMethod    = getItemString(doc, "HttpMethod");
-                    tc.authHeader    = getItemString(doc, "AuthHeader");
+                    tc.name = getItemString(doc, "TargetName");
+                    tc.subType = getItemString(doc, "SubType");
+                    tc.apiUrl = getItemString(doc, "ApiUrl");
+                    tc.httpMethod = getItemString(doc, "HttpMethod");
+                    tc.authHeader = getItemString(doc, "AuthHeader");
 
                     if (tc.httpMethod == null || tc.httpMethod.length() == 0) {
                         tc.httpMethod = "GET";
                     }
 
                     // Timeouts
-                    tc.connectTimeoutMs = getItemInt(doc,
-                        "ConnectTimeoutMs", DEFAULT_CONNECT_TIMEOUT_MS);
-                    tc.readTimeoutSec = getItemInt(doc,
-                        "ReadTimeoutSec", DEFAULT_SYNC_TIMEOUT_SEC);
-                    tc.cacheWaitSec = getItemInt(doc,
-                        "CacheWaitSec", DEFAULT_CACHE_WAIT_SEC);
-                    tc.bgTimeoutSec = getItemInt(doc,
-                        "BgTimeoutSec", DEFAULT_BG_TIMEOUT_SEC);
+                    tc.connectTimeoutSec = getItemInt(doc, "ConnectTimeoutSec", DEFAULT_CONNECT_TIMEOUT_SEC);
+                    tc.readTimeoutSec = getItemInt(doc, "ReadTimeoutSec", DEFAULT_SYNC_TIMEOUT_SEC);
+                    tc.cacheWaitSec = getItemInt(doc, "CacheWaitSec", DEFAULT_CACHE_WAIT_SEC);
+                    tc.bgTimeoutSec = getItemInt(doc, "BgTimeoutSec", DEFAULT_BG_TIMEOUT_SEC);
 
                     // Cached mode — from config or auto-detect by subtype
                     String cachedFlag = getItemString(doc, "UseCachedMode");
                     if ("1".equals(cachedFlag) || "Yes".equalsIgnoreCase(cachedFlag)) {
                         tc.useCachedMode = true;
-                    } else {
+                    }
+                    else {
                         tc.useCachedMode = false;
                     }
 
                     // Custom headers (multi-value field: "Header-Name: value")
-                    java.util.Vector<?> headers =
-                        doc.getItemValue("CustomHeaders");
+                    java.util.Vector<?> headers = doc.getItemValue("CustomHeaders");
                     if (headers != null && headers.size() > 0) {
                         tc.customHeaders = new java.util.LinkedHashMap<>();
                         for (Object h : headers) {
                             String hs = h.toString().trim();
                             int colon = hs.indexOf(':');
                             if (colon > 0) {
-                                tc.customHeaders.put(
-                                    hs.substring(0, colon).trim(),
-                                    hs.substring(colon + 1).trim());
+                                tc.customHeaders.put(hs.substring(0, colon).trim(), hs.substring(colon + 1).trim());
                             }
                         }
                     }
 
-                    if (tc.name != null && tc.name.length() > 0
-                            && tc.apiUrl != null && tc.apiUrl.length() > 0) {
+                    if (tc.name != null && tc.name.length() > 0 && tc.apiUrl != null && tc.apiUrl.length() > 0) {
                         newTargets.put(tc.name.toLowerCase(), tc);
-                        consoleLog("ApiCheckServlet: Loaded target '"
-                            + tc.name + "' [" + tc.subType + "] "
-                            + (tc.useCachedMode ? "CACHED" : "SYNC"));
+                        consoleLog("ApiCheckServlet: Loaded target '" + tc.name + "' [" + tc.subType + "] "
+                                + (tc.useCachedMode ? "CACHED" : "SYNC"));
                     }
 
                 } catch (Exception e) {
-                    consoleLog("ApiCheckServlet: Error reading config doc: "
-                        + e.getMessage());
+                    consoleLog("ApiCheckServlet: Error reading config doc: " + e.getMessage());
                 }
 
                 lotus.domino.Document next = view.getNextDocument(doc);
@@ -691,11 +675,9 @@ public class ApiCheckServlet extends HttpServlet {
                 doc = next;
             }
         } catch (lotus.domino.NotesException ne) {
-            consoleLog("ApiCheckServlet: ERROR loading config: "
-                + ne.getMessage());
+            consoleLog("ApiCheckServlet: ERROR loading config: " + ne.getMessage());
         } catch (Exception e) {
-            consoleLog("ApiCheckServlet: ERROR loading config: "
-                + e.getMessage());
+            consoleLog("ApiCheckServlet: ERROR loading config: " + e.getMessage());
         } finally {
             recycleQuietly(view);
             recycleQuietly(db);
@@ -711,26 +693,18 @@ public class ApiCheckServlet extends HttpServlet {
     // LOGGER — writes to servletlog.nsf (async to not block response)
     // ========================================================================
 
-    private void logCallAsync(final String targetName,
-                              final String subType,
-                              final String apiUrl,
-                              final int httpCode,
-                              final long durationMs,
-                              final String errorMsg,
-                              final String mode) {
+    private void logCallAsync(final String targetName, final String subType, final String apiUrl, final int httpCode,
+            final long durationMs, final String errorMsg, final String mode) {
         bgExecutor.submit(new Runnable() {
             @Override
             public void run() {
-                logCall(targetName, subType, apiUrl,
-                    httpCode, durationMs, errorMsg, mode);
+                logCall(targetName, subType, apiUrl, httpCode, durationMs, errorMsg, mode);
             }
         });
     }
 
-    private void logCall(String targetName, String subType,
-                         String apiUrl, int httpCode,
-                         long durationMs, String errorMsg,
-                         String mode) {
+    private void logCall(String targetName, String subType, String apiUrl, int httpCode, long durationMs,
+            String errorMsg, String mode) {
         lotus.domino.Session session = null;
         lotus.domino.Database db = null;
         lotus.domino.Document doc = null;
@@ -741,8 +715,7 @@ public class ApiCheckServlet extends HttpServlet {
             db = session.getDatabase(dominoServer, logDb, false);
 
             if (db == null || !db.isOpen()) {
-                consoleLog("ApiCheckServlet: WARNING — Cannot open "
-                    + logDb + " for logging");
+                consoleLog("ApiCheckServlet: WARNING — Cannot open " + logDb + " for logging");
                 return;
             }
 
@@ -755,13 +728,13 @@ public class ApiCheckServlet extends HttpServlet {
             doc.replaceItemValue("DurationMs", durationMs);
             doc.replaceItemValue("Mode", mode);
             doc.replaceItemValue("ActiveCalls", activeCallCount.get());
-            doc.replaceItemValue("CallTimestamp",
-                session.createDateTime(new Date()));
+            doc.replaceItemValue("CallTimestamp", session.createDateTime(new Date()));
 
             if (errorMsg != null) {
                 doc.replaceItemValue("ErrorMsg", errorMsg);
                 doc.replaceItemValue("Success", "0");
-            } else {
+            }
+            else {
                 doc.replaceItemValue("ErrorMsg", "");
                 doc.replaceItemValue("Success", "1");
             }
@@ -769,8 +742,7 @@ public class ApiCheckServlet extends HttpServlet {
             doc.save(true, false);
 
         } catch (Exception e) {
-            consoleLog("ApiCheckServlet: WARNING — Log write failed: "
-                + e.getMessage());
+            consoleLog("ApiCheckServlet: WARNING — Log write failed: " + e.getMessage());
         } finally {
             recycleQuietly(doc);
             recycleQuietly(db);
@@ -790,10 +762,10 @@ public class ApiCheckServlet extends HttpServlet {
 
     /** Read an InputStream to String */
     private static String readStream(InputStream is) throws IOException {
-        if (is == null) return null;
+        if (is == null)
+            return null;
         StringBuilder sb = new StringBuilder();
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(is, "UTF-8"))) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 sb.append(line);
@@ -804,19 +776,17 @@ public class ApiCheckServlet extends HttpServlet {
 
     /** Safe JSON string escape */
     private static String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
+        if (s == null)
+            return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t",
+                "\\t");
     }
 
     /** Format timestamp to ISO 8601 UTC */
     private static String formatTimestamp(long ts) {
-        if (ts == 0) return "never";
-        SimpleDateFormat sdf =
-            new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'");
+        if (ts == 0)
+            return "never";
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'");
         sdf.setTimeZone(TimeZone.getTimeZone("UTC"));
         return sdf.format(new Date(ts));
     }
@@ -827,8 +797,7 @@ public class ApiCheckServlet extends HttpServlet {
     }
 
     /** Get string item from Notes document, null-safe */
-    private static String getItemString(lotus.domino.Document doc,
-                                        String itemName) {
+    private static String getItemString(lotus.domino.Document doc, String itemName) {
         try {
             String val = doc.getItemValueString(itemName);
             return (val != null && val.length() > 0) ? val.trim() : null;
@@ -838,12 +807,11 @@ public class ApiCheckServlet extends HttpServlet {
     }
 
     /** Get integer item from Notes document with default */
-    private static int getItemInt(lotus.domino.Document doc,
-                                  String itemName, int defaultVal) {
+    private static int getItemInt(lotus.domino.Document doc, String itemName, int defaultVal) {
         try {
             String val = doc.getItemValueString(itemName);
             if (val != null && val.length() > 0) {
-                return (int)Long.parseLong(val.trim());
+                return (int) Long.parseLong(val.trim());
             }
         } catch (Exception e) {
             // ignore parse errors
@@ -856,7 +824,8 @@ public class ApiCheckServlet extends HttpServlet {
         StringBuilder sb = new StringBuilder("[");
         boolean first = true;
         for (TargetConfig tc : targets.values()) {
-            if (!first) sb.append(",");
+            if (!first)
+                sb.append(",");
             first = false;
             sb.append("\"").append(escapeJson(tc.name)).append("\"");
         }
@@ -867,7 +836,10 @@ public class ApiCheckServlet extends HttpServlet {
     /** Safe recycle for Domino objects */
     private static void recycleQuietly(lotus.domino.Base obj) {
         if (obj != null) {
-            try { obj.recycle(); } catch (Exception e) { /* ignore */ }
+            try {
+                obj.recycle();
+            } catch (Exception e) {
+                /* ignore */ }
         }
     }
 }

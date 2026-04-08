@@ -31,8 +31,8 @@ public class TargetConfig {
     /** Additional HTTP headers: key=header name, value=header value */
     public Map<String, String> customHeaders;
 
-    /** TCP connect timeout in milliseconds */
-    public int connectTimeoutMs = 10_000;
+    /** TCP connect timeout in seconds */
+    public int connectTimeoutSec = 60;
 
     /** Read timeout for synchronous mode (seconds) */
     public int readTimeoutSec = 60;
