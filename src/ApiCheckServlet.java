@@ -106,6 +106,15 @@ public class ApiCheckServlet extends HttpServlet {
     @Override
     public void init(ServletConfig config) throws ServletException {
         super.init(config);
+
+        // Log Java environment info on startup
+        String version = System.getProperty("java.version");          // e.g., "1.8.0_202"
+        String vendor  = System.getProperty("java.vendor");           // e.g., "IBM Corporation"
+        String spec    = System.getProperty("java.specification.version"); // e.g., "1.8"
+        String vmName  = System.getProperty("java.vm.name");          // e.g., "IBM J9 VM"
+        consoleLog("ApiCheckServlet: Starting up with Java "
+            + version + " (" + vendor + ", " + vmName + ", spec " + spec + ")");    
+
         initTimestamp = System.currentTimeMillis();
 
         // Read secret key from init args if provided
@@ -245,7 +254,7 @@ public class ApiCheckServlet extends HttpServlet {
             conn.setRequestMethod(tc.httpMethod);
             conn.setConnectTimeout(tc.connectTimeoutMs);
             conn.setReadTimeout(tc.readTimeoutSec * 1000);
-
+            
             // Set headers
             if (tc.authHeader != null && tc.authHeader.length() > 0) {
                 conn.setRequestProperty("Authorization", tc.authHeader);
@@ -253,16 +262,19 @@ public class ApiCheckServlet extends HttpServlet {
             conn.setRequestProperty("Accept", "application/json");
 
             // Add custom headers from config
+            
             if (tc.customHeaders != null) {
                 for (Map.Entry<String, String> h : tc.customHeaders.entrySet()) {
                     conn.setRequestProperty(h.getKey(), h.getValue());
                 }
             }
-
+            
             apiCode = conn.getResponseCode();
             apiData = readStream(
                 (apiCode >= 200 && apiCode < 300)
                     ? conn.getInputStream() : conn.getErrorStream());
+
+            consoleLog("ApiCheckServlet: [SYNC] read response after timeout: " + tc.connectTimeoutMs + " ms, API code: " + apiCode + ", data length: " + (apiData != null ? apiData.length() : "null"));
 
         } catch (java.net.SocketTimeoutException e) {
             errorMsg = "timeout: " + e.getMessage();
@@ -281,7 +293,7 @@ public class ApiCheckServlet extends HttpServlet {
 
         long durationMs = System.currentTimeMillis() - startTime;
 
-        // Log to servletlog.nsf
+        // Log to a log database
         logCallAsync(tc.name, tc.subType, tc.apiUrl, apiCode,
             durationMs, errorMsg, "SYNC");
 
@@ -688,6 +700,7 @@ public class ApiCheckServlet extends HttpServlet {
             recycleQuietly(view);
             recycleQuietly(db);
             recycleQuietly(session);
+            NotesThread.stermThread(); // deregister — always runs, even on exception
         }
 
         targets = newTargets;
@@ -762,6 +775,7 @@ public class ApiCheckServlet extends HttpServlet {
             recycleQuietly(doc);
             recycleQuietly(db);
             recycleQuietly(session);
+            NotesThread.stermThread(); // deregister — always runs, even on exception
         }
     }
 
@@ -829,7 +843,7 @@ public class ApiCheckServlet extends HttpServlet {
         try {
             String val = doc.getItemValueString(itemName);
             if (val != null && val.length() > 0) {
-                return Integer.parseInt(val.trim());
+                return (int)Long.parseLong(val.trim());
             }
         } catch (Exception e) {
             // ignore parse errors
