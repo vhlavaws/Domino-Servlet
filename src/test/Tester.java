@@ -9,6 +9,8 @@ import java.net.URL;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.TimeZone;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
@@ -33,6 +35,7 @@ public class Tester {
         int tcConnectTimeoutSec = 60;
         int tcReadTimeoutSec = 10;
         String tcAuth = "Bearer 123456789abcdef";
+        //String tcAuth = "Bearer copy the actual token here";
         long startTime = System.currentTimeMillis();
 
         consoleLog("UNIT Tesst ApiCheck: [SYNC] '" + tcName + "' started ");
@@ -148,8 +151,12 @@ public class Tester {
         json.append("}");
 
        consoleLog(json.toString());
-        
 
+       // Rebuild response for PRTG
+       StringBuilder prtgJson = buildTeamViewerResponse(apiData);
+       consoleLog("______________________________________");
+       consoleLog(prtgJson.toString());
+        consoleLog("______________________________________");
     }
 
     /** Log to Domino server console */
@@ -174,14 +181,17 @@ public class Tester {
     
     /** Safe JSON string escape */
     private static String escapeJson(String s) {
-        if (s == null) return "";
+        if (s == null)
+            return "";
         return s.replace("\\", "\\\\")
                 .replace("\"", "\\\"")
                 .replace("\n", "\\n")
                 .replace("\r", "\\r")
-                .replace("\t", "\\t");
+                .replace("\t",
+                "\\t");
     }
-        /** Format timestamp to ISO 8601 UTC */
+
+    /** Format timestamp to ISO 8601 UTC */
     private static String formatTimestamp(long ts) {
         if (ts == 0) return "never";
         SimpleDateFormat sdf =
@@ -193,6 +203,41 @@ public class Tester {
     /** Current UTC timestamp as ISO string */
     private static String utcNow() {
         return formatTimestamp(System.currentTimeMillis());
+    }
+
+    private static StringBuilder buildTeamViewerResponse(String apiData) {
+        StringBuilder json = new StringBuilder();
+
+        // Regex logic: Find "online_state" and capture the value between quotes
+        // \"online_state\"\s*:\s*\"([^\"]*)\"
+        // 1. Match the key "online_state"
+        // 2. \s*:\s* handles potential whitespace around the colon
+        // 3. \"([^\"]*)\" captures everything inside the following quotes
+        Pattern pattern = Pattern.compile("\"online_state\"\\s*:\\s*\"([^\"]*)\"");
+        Matcher matcher = pattern.matcher(apiData);
+        String device_status = "Unknown";
+        if (matcher.find()) {
+           device_status = matcher.group(1);
+        }
+
+        // Reexx logic to extract teamviewer_id
+        pattern = Pattern.compile("\"teamviewer_id\"\\s*:\\s*(\\d+)");
+        matcher = pattern.matcher(apiData);
+        String tv_Id = "-1";
+        if (matcher.find()) {
+            tv_Id = matcher.group(1);
+        }
+
+        json.append("{").append("\"prtg\":{");
+            json.append("\"result\":[")
+                .append("{\"channel\":\"Status\",\"value\":")
+                .append(device_status.equals("Online") ? "1" : "0") .append("},")
+                .append("{\"channel\":\"TeamViewerID\",\"value\":")
+                .append(tv_Id)  .append("}")
+                .append("]}");
+        
+        return json;
+        
     }
 }
 
