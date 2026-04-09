@@ -2,6 +2,8 @@ import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
+import lotus.domino.Document;
+import lotus.domino.NotesException;
 import lotus.domino.NotesThread;
 
 import javax.servlet.ServletException;
@@ -18,14 +20,17 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.List;
 import java.util.Map;
 import java.util.TimeZone;
+import java.util.Vector;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
  * ApiCheckServlet — Multi-target API monitoring servlet for HCL Domino.
@@ -75,6 +80,9 @@ public class ApiCheckServlet extends HttpServlet {
 
     //** Log level */
     private static String logLevel = "WARNING";
+
+    /** Blacklisted IP addresses (regex patterns) */
+    private List<Pattern> blockedIpPatterns;
 
     // ========================================================================
     // SHARED STATE
@@ -127,12 +135,7 @@ public class ApiCheckServlet extends HttpServlet {
         
         initTimestamp = System.currentTimeMillis();
 
-        // Read secret key from init args if provided
-        String keyParam = config.getInitParameter("secretKey");
-        if (keyParam != null && keyParam.length() > 0) {
-            secretKey = keyParam;
-        }
-
+        // Get path to config db from init args
         String dbParam = config.getInitParameter("configDbPath");
         if (dbParam != null && dbParam.length() > 0) {
             configDb = dbParam;
@@ -148,13 +151,7 @@ public class ApiCheckServlet extends HttpServlet {
             dominoServer = serverParam;
         }
 
-        String logLevelParam = config.getInitParameter("logLevel");
-        if (logLevelParam == null || logLevelParam.length() == 0) {
-            logLevel = "WARNING";
-        } else {
-            logLevel = logLevelParam;
-        }
-
+        
         // Create bounded thread pool
         bgExecutor = Executors.newFixedThreadPool(MAX_BG_THREADS);
 
@@ -185,19 +182,41 @@ public class ApiCheckServlet extends HttpServlet {
 
         PrintWriter out = response.getWriter();
 
-        // --- Log API Request ---
+        // --- Get and validate Request params ---  
         String keyParam = request.getParameter("key");
         String action = request.getParameter("action");
         String targetName = request.getParameter("target");
-        consoleLog("ApiCheckServlet: Calling with params - action=" + action + ", target=" + targetName);
 
         // --- Auth check ---
         if (keyParam == null || !keyParam.equals(secretKey)) {
-            response.setStatus(403);
-            out.print("{\"error\":\"unauthorized\"}");
-            out.flush();
+            handleNotAuthorized(response, out);
             return;
         }
+
+        // Get the IP address
+        String ipAddress = getClientIP(request);
+        
+        // High-speed check against pre-compiled patterns
+        for (Pattern p : blockedIpPatterns) {
+            if (p.matcher(ipAddress).matches()) {
+                handleNotAuthorizedIP(response, out, ipAddress);
+                return;
+            }
+        }
+
+        // Get the HTTP method (GET, POST, etc.)
+        String method = request.getMethod();
+
+        // Get the User-Agent (Browser/Client info)
+        String userAgent = request.getHeader("User-Agent");
+
+        // Get the full URL requested
+        String url = request.getRequestURI().toString();
+
+
+        consoleLog("ApiCheckServlet: Calling with params - action=" + action + ", target=" + targetName);
+
+
 
         // --- Action routing ---
         if ("status".equals(action)) {
@@ -236,6 +255,42 @@ public class ApiCheckServlet extends HttpServlet {
         else {
             handleSyncTarget(tc, response, out);
         }
+    }
+
+    /**
+     * Extracts the client's real IP address from the request, accounting for possible proxy headers. 
+     * Checks the "X-Forwarded-For" header first (which may contain multiple IPs if there are multiple proxies).
+     * Falls back to request.getRemoteAddr() if the header is not present.
+     * @param request The HttpServletRequest object containing the client's request information.
+     * @return The client's IP address as a String. If multiple IPs are present in "X-Forwarded-For", returns the first one (the original client).
+     */
+    private String getClientIP(HttpServletRequest request) {
+        String clientIp = request.getHeader("X-Forwarded-For");
+        if (clientIp == null || clientIp.isEmpty()) {
+            clientIp = request.getRemoteAddr();
+        }
+        else {
+            // If multiple proxies exist, it returns "client, proxy1, proxy2"
+            clientIp = clientIp.split(",")[0].trim();
+        }
+        return clientIp;
+    }
+
+    private void handleNotAuthorized(HttpServletResponse response, PrintWriter out) {
+        response.setStatus(403);
+        consoleLog("INFO", "Provided secretKey is not valid. Servlet Access denied.");
+        out.print("{\"error\":\"unauthorized\"}");
+        out.flush();
+        //TODO create Notes Log document about unauthorized access attempt with IP and User-Agent for better monitoring of potential attacks
+    }
+
+    private void handleNotAuthorizedIP(HttpServletResponse response, PrintWriter out, String clientIp) {
+      // response.sendError(HttpServletResponse.SC_FORBIDDEN, "{\"error\":\"IP " + clientIp + " blocked\"}");
+        response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        consoleLog("INFO", "Client IP is blocked: " + clientIp);
+        out.print("{\"error\":\"unauthorized\"}");
+        out.flush();
+        // TODO create Notes Log document about unauthorized access attempt with IP and User-Agent for better monitoring of potential attacks
     }
 
     // ========================================================================
@@ -401,6 +456,7 @@ public class ApiCheckServlet extends HttpServlet {
         // 2. \s*:\s* handles potential whitespace around the colon
         // 3. \"([^\"]*)\" captures everything inside the following quotes
         Pattern pattern = Pattern.compile("\"online_state\"\\s*:\\s*\"([^\"]*)\"");
+        // Pattern pattern = Pattern.compile("\"online_state\"\s*:\s*\"([^\"]*)\"");
         Matcher matcher = pattern.matcher(apiData);
         String device_status = "Unknown";
         if (matcher.find()) {
@@ -409,6 +465,7 @@ public class ApiCheckServlet extends HttpServlet {
 
         // Reexx logic to extract teamviewer_id
         pattern = Pattern.compile("\"teamviewer_id\"\\s*:\\s*(\\d+)");
+        // pattern = Pattern.compile("\"teamviewer_id\"\s*:\s*(\d+)");
         matcher = pattern.matcher(apiData);
         String tv_Id = "-1";
         if (matcher.find()) {
@@ -440,14 +497,16 @@ public class ApiCheckServlet extends HttpServlet {
         // 2. \s*:\s* handles potential whitespace around the colon
         // 3. \"([^\"]*)\" captures everything inside the following quotes
         Pattern pattern = Pattern.compile("\"online_state\"\\s*:\\s*\"([^\"]*)\"");
+        // Pattern pattern = Pattern.compile("\"online_state\"\s*:\s*\"([^\"]*)\"");
         Matcher matcher = pattern.matcher(apiData);
         String device_status = "Unknown";
         if (matcher.find()) {
            device_status = matcher.group(1);
         }
 
-        // Reexx logic to extract teamviewer_id
+        // Regex logic to extract teamviewer_id
         pattern = Pattern.compile("\"teamviewer_id\"\\s*:\\s*(\\d+)");
+        // pattern = Pattern.compile("\"teamviewer_id\"\s*:\s*(\d+)");
         matcher = pattern.matcher(apiData);
         String tv_Id = "-1";
         if (matcher.find()) {
@@ -786,9 +845,26 @@ public class ApiCheckServlet extends HttpServlet {
                 return 0;
             }
 
-            view = db.getView("($APIChecksActiveTargets)");
+            lotus.domino.Document profile = db.getProfileDocument("Profile", null);
+            String logLevelParam = getItemString(profile, "LogLevel");
+            if (logLevelParam != null && logLevelParam.length() > 0) {
+                logLevel = logLevelParam;
+            }
+
+            String keyParam = getItemString(profile, "SecretKey");
+            if (keyParam != null && keyParam.length() > 0) {  
+                secretKey = keyParam;
+                consoleLog("INFO","Servlet secret key initialized from config's database profile.");
+            } 
+
+            loadBlockeIPList(profile);
+
+
+            recycleQuietly(profile);
+            
+            view = db.getView("()");
             if (view == null) {
-                consoleLog("ApiCheckServlet: ERROR — View '($APIChecksActiveTargets)' " + "not found in " + configDb);
+                consoleLog("ApiCheckServlet: ERROR — View '()' " + "not found in " + configDb);
                 return 0;
             }
 
@@ -865,10 +941,28 @@ public class ApiCheckServlet extends HttpServlet {
         return newTargets.size();
     }
 
+    private void loadBlockeIPList(Document profile) throws NotesException {
+      Vector<?> rawValues = profile.getItemValue("IPs_Blocked");
+        for (Object val : rawValues) {
+            String entry = (val != null) ? val.toString().trim() : "";
+            if (entry.isEmpty()) continue;
+
+            // Handle potential comma-separated values within a single Vector element
+            String[] parts = entry.split(",");
+            for (String part : parts) {
+                try {
+                    // Compile once and store in memory
+                    blockedIpPatterns.add(Pattern.compile(part.trim()));
+                } catch (PatternSyntaxException e) {
+                    consoleLog("ApiCheckServlet: [WARN] - Invalid Regex ignored: " + part);
+                }
+            }
+        }
+    }
+
     // ========================================================================
     // LOGGER — writes to servletlog.nsf (async to not block response)
     // ========================================================================
-
     private void logCallAsync(final String targetName, final String subType,  final String apiUrl, final String mode, 
             final int httpCode, final long durationMs, final String errorMsg, final String apiData) {
         bgExecutor.submit(new Runnable() {
