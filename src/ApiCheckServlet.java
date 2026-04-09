@@ -418,11 +418,13 @@ public class ApiCheckServlet extends HttpServlet {
         json.append("{").append("\"prtg\":{");
             json.append("\"result\":[")
                 .append("{\"channel\":\"Status\",\"value\":")
-                .append(device_status.equals("Online") ? "1" : "0") .append("},")
+                .append(device_status.equals("Online") ? "1" : "0").append("},")
                 .append("{\"channel\":\"TeamViewerID\",\"value\":")
-                .append(tv_Id)  .append("}")
+                .append(tv_Id).append("},")
                 .append("{\"channel\":\"ResponseTime\",\"value\":")
-                .append(durationMs) .append("}")
+                .append(durationMs).append("},")
+                .append("{\"channel\":\"JVM used memory\",\"value\":")
+                .append(usedMemory).append("}")
                 .append("]}}");
         
         return json;
@@ -500,7 +502,7 @@ public class ApiCheckServlet extends HttpServlet {
                 .append("]}");
         return json;  
     }
-    
+
     private void setRequestProperties(HttpURLConnection conn, TargetConfig tc) throws Exception {
 
         // Set timeouts and method
