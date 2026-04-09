@@ -479,25 +479,25 @@ public class ApiCheckServlet extends HttpServlet {
                     .append("\"name\":\"Availability\",")
                     .append("\"type\":\"integer\",")
                     .append("\"kind\":\"count\",")
-                    .append("value\":").append(device_status.equals("Online") ? "1" : "0").append("},")
+                    .append("\"value\":").append(device_status.equals("Online") ? "1" : "0").append("},")
         
                     .append("{\"id\":11,")
                     .append("\"name\":\"Response Time\",")
                     .append("\"type\":\"float\",")
                     .append("\"kind\":\"time_milliseconds\",")
-                    .append("value\":").append(durationMs).append("},")
+                    .append("\"value\":").append(durationMs).append("},")
 
                     .append("{\"id\":12,")
                     .append("\"name\":\"JVM Heap Memory\",")
                     .append("\"type\":\"float\",")
                     .append("\"kind\":\"size_bytes_memory\",")
-                    .append("value\":").append(usedMemory).append("},")
+                    .append("\"value\":").append(usedMemory).append("},")
 
                     .append("{\"id\":13,")
                     .append("\"name\":\"TeamViewerID\",")
                     .append("\"type\":\"float\",")
                     .append("\"kind\":\"custom\",")
-                    .append("value\":").append(tv_Id).append(",")
+                    .append("\"value\":").append(tv_Id).append(",")
                     .append("\"display_unit\":\"\"").append("}")
                 .append("]}");
         return json;  
