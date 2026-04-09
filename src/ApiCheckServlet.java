@@ -333,6 +333,13 @@ public class ApiCheckServlet extends HttpServlet {
     private void buildApiResponse(TargetConfig tc, HttpServletResponse response, PrintWriter out, int apiCode,
             String apiData, String errorMsg, long durationMs) {
 
+        // get used memory
+        Runtime runtime = Runtime.getRuntime();
+        // long maxMemory = runtime.maxMemory();        // -Xmx (Maximum possible heap)
+        long allocatedMemory = runtime.totalMemory();   // Current heap size (can grow up to max)
+        long freeMemory = runtime.freeMemory();         // Free space WITHIN the allocated heap   
+        long usedMemory = allocatedMemory - freeMemory; // The actual memory used by objects
+
         // Set common response headers
         response.setStatus(200);
         // Set content type and caching headers
@@ -348,10 +355,10 @@ public class ApiCheckServlet extends HttpServlet {
         switch (tc.subType) {
         case "TeamViewer":
         case "TeamViewerAPI for PRTG REST Custom V2":
-            json = buildTeamViewerResponseV2(apiData);  
+            json = buildTeamViewerResponseV2(apiData, errorMsg, usedMemory, durationMs);  
             break;
         case "TeamViewerAPI for PRTG REST JSON DATA":
-            json = buildTeamViewerResponseV3(apiData);  
+            json = buildTeamViewerResponseV3(apiData, errorMsg, usedMemory, durationMs);  
             break;
         default:
             json = new StringBuilder();
@@ -360,6 +367,7 @@ public class ApiCheckServlet extends HttpServlet {
             json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
             json.append(",\"mode\":\"sync\"");
             json.append(",\"durationMs\":").append(durationMs);
+            json.append(",\"JVM used memory\":").append(usedMemory);
 
             if (errorMsg != null) {
                 json.append(",\"status\":\"error\"");
@@ -384,7 +392,7 @@ public class ApiCheckServlet extends HttpServlet {
         out.print(json.toString());
     }
 
-    private StringBuilder buildTeamViewerResponseV2(String apiData) {
+    private StringBuilder buildTeamViewerResponseV2(String apiData, String errorMsg, long usedMemory, long durationMs) {
         StringBuilder json = new StringBuilder();
 
         // Regex logic: Find "online_state" and capture the value between quotes
@@ -413,13 +421,15 @@ public class ApiCheckServlet extends HttpServlet {
                 .append(device_status.equals("Online") ? "1" : "0") .append("},")
                 .append("{\"channel\":\"TeamViewerID\",\"value\":")
                 .append(tv_Id)  .append("}")
+                .append("{\"channel\":\"ResponseTime\",\"value\":")
+                .append(durationMs) .append("}")
                 .append("]}}");
         
         return json;
         
     }
 
-   private StringBuilder buildTeamViewerResponseV3(String apiData) {
+   private StringBuilder buildTeamViewerResponseV3(String apiData, String errorMsg, long usedMemory, long durationMs) {
         StringBuilder json = new StringBuilder();
 
         // Regex logic: Find "online_state" and capture the value between quotes
@@ -442,17 +452,55 @@ public class ApiCheckServlet extends HttpServlet {
             tv_Id = matcher.group(1);
         }
 
-        json.append("{").append("\"prtg\":{");
-            json.append("\"result\":[")
-                .append("{\"channel\":\"Status\",\"value\":")
-                .append(device_status.equals("Online") ? "1" : "0") .append("},")
-                .append("{\"channel\":\"TeamViewerID\",\"value\":")
-                .append(tv_Id)  .append("}")
-                .append("]}}");
+        // Status PRTG Statuses: Up status: OK, Warning status: Warning, Down status: Error, Unknown status: Unknown
+        String statusString = "Unknown";
+        switch (device_status) {
+            case "Online":
+                statusString = (durationMs > 10000) ? "Warning" : "OK";
+                break;
+            case "Offline":
+                statusString = "Error";
+                break;
+            case "Unknown":
+                statusString = "Unknown";
+                break;
+            default:
+                statusString = "Unknown";
+        }
         
-        return json;
+        json.append("{")
+                .append("\"version\":3,")
+                .append("\"status\":\"").append(statusString).append("\",")
+                .append("\"message\":\"TeamViewer status (ID: ").append(tv_Id).append(")\",")
+                .append("\"channels\":[")
+                    .append("{\"id\":10,")
+                    .append("\"name\":\"Availability\",")
+                    .append("\"type\":\"integer\",")
+                    .append("\"kind\":\"count\",")
+                    .append("value\":").append(device_status.equals("Online") ? "1" : "0").append("},")
         
+                    .append("{\"id\":11,")
+                    .append("\"name\":\"Response Time\",")
+                    .append("\"type\":\"float\",")
+                    .append("\"kind\":\"time_milliseconds\",")
+                    .append("value\":").append(durationMs).append("},")
+
+                    .append("{\"id\":12,")
+                    .append("\"name\":\"JVM Heap Memory\",")
+                    .append("\"type\":\"float\",")
+                    .append("\"kind\":\"size_bytes_memory\",")
+                    .append("value\":").append(usedMemory).append("},")
+
+                    .append("{\"id\":13,")
+                    .append("\"name\":\"TeamViewerID\",")
+                    .append("\"type\":\"float\",")
+                    .append("\"kind\":\"custom\",")
+                    .append("value\":").append(tv_Id).append(",")
+                    .append("\"display_unit\":\"\"").append("}")
+                .append("]}");
+        return json;  
     }
+    
     private void setRequestProperties(HttpURLConnection conn, TargetConfig tc) throws Exception {
 
         // Set timeouts and method
