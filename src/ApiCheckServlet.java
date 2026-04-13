@@ -19,9 +19,7 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.text.SimpleDateFormat;
-import java.util.Collections;
 import java.util.Date;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -55,16 +53,16 @@ public class ApiCheckServlet extends HttpServlet {
     // ========================================================================
 
     /** Default seconds to wait for fresh result on cached subtypes */
-    private static final int DEFAULT_CACHE_WAIT_SEC = 20;
+    private static final int DEFAULT_CACHE_WAIT_SEC = 21;
 
     /** Default total seconds for background thread on cached subtypes */
-    private static final int DEFAULT_BG_TIMEOUT_SEC = 80;
+    private static final int DEFAULT_BG_TIMEOUT_SEC = 81;
 
     /** Default connect timeout in seconds */
-    private static final int DEFAULT_CONNECT_TIMEOUT_SEC = 60;
+    private static final int DEFAULT_CONNECT_TIMEOUT_SEC = 61;
 
     /** Default read timeout for synchronous subtypes (seconds) */
-    private static final int DEFAULT_SYNC_TIMEOUT_SEC = 60;
+    private static final int DEFAULT_SYNC_TIMEOUT_SEC = 61;
 
     /** Max background threads for async API calls */
     private static final int MAX_BG_THREADS = 15;
@@ -73,19 +71,19 @@ public class ApiCheckServlet extends HttpServlet {
     private static String secretKey = "SECRET";
 
     /** Domino server name for NotesFactory (empty = local) */
-    private static String dominoServer = "Django";
+    private static String dominoServer = "Djangooo";
 
     /** Config database filename */
-    private static String configDb = "tools/servlets_config.nsf";
+    private static String configDb = "tools/servlets_configoo.nsf";
 
     /** Log database filename */
-    private static String logDb = "tools/servlets_config.nsf";
+    private static String logDb = "tools/servlets_configoo.nsf";
 
     //** Log level */
     private static String logLevel = "WARNING";
 
     /** Blacklisted IP addresses (regex patterns) */
-    private List<Pattern> blockedIpPatterns;
+    private List<Pattern> blockedIpPatterns = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     // ========================================================================
     // SHARED STATE
@@ -111,7 +109,8 @@ public class ApiCheckServlet extends HttpServlet {
     private static long initTimestamp = 0;
 
     /** Do not log IP addresses listed here */
-    private static final Set<String> noLogIps = Collections.synchronizedSet(new HashSet<>());
+    private final Set<String> noLogIps = ConcurrentHashMap.newKeySet();
+    
 
     // ========================================================================
     // LIFECYCLE
@@ -202,14 +201,12 @@ public class ApiCheckServlet extends HttpServlet {
         
         // Get the HTTP method (GET, POST, etc.), User-Agent (Browser/Client info), Get the full URL requested
         ctx.setCaller(ipAddress, request.getHeader("User-Agent"), request.getMethod(), request.getRequestURI().toString());
-           
 
         // --- Auth check ---
         if (keyParam == null || !keyParam.equals(secretKey)) {
             handleNotAuthorized(response, out, ctx);
             return;
         }
-
 
         // High-speed check against pre-compiled patterns
         for (Pattern p : blockedIpPatterns) {
@@ -220,11 +217,11 @@ public class ApiCheckServlet extends HttpServlet {
         }
         
         // --- Action routing ---
-        if ("status".equals(action)) {
+        if ("status".equalsIgnoreCase(action)) {
             handleStatus(response, out, ctx);
             return;
         }
-        if ("reload".equals(action)) {
+        if ("reload".equalsIgnoreCase(action)) {
             handleReload(response, out, ctx);
             return;
         }
@@ -234,6 +231,7 @@ public class ApiCheckServlet extends HttpServlet {
             response.setStatus(400);
             out.print("{\"error\":\"missing 'target' parameter\"}");
             out.flush();
+            //TODO handle missing target
             return;
         }
 
@@ -245,7 +243,7 @@ public class ApiCheckServlet extends HttpServlet {
             out.flush();
             return;
         }
-
+        
         // --- Dispatch based on subtype ---
        consoleLog("INFO", "ApiCheckServlet: [" + tc.subType + "] " + "Checking target '" + tc.name + "' -> " + tc.apiUrl);
         
@@ -295,7 +293,6 @@ public class ApiCheckServlet extends HttpServlet {
             final LogContext finalCtx = ctx;
             logCallAsync(finalCtx);
         }
-       
     }
 
     private void handleNotAuthorizedIP(HttpServletResponse response, PrintWriter out, LogContext ctx) {
@@ -314,6 +311,7 @@ public class ApiCheckServlet extends HttpServlet {
             consoleLog("INFO", "Client IP is blocked: " + ctx.ipAddress + ". Servlet Access denied. IP added to block list: " + ctx.ipAddress);
             ctx.setErrorMsg("Client IP: " + ctx.ipAddress + " is blocked. No more logs will be recorded for this IP address");
             ctx.setResult(false, "Blocked IP");
+            
             // make logContext final for thread use
             final LogContext finalCtx = ctx;
             logCallAsync(finalCtx);
@@ -379,45 +377,52 @@ public class ApiCheckServlet extends HttpServlet {
 
                 apiCode = conn.getResponseCode();
             }
+
             apiData = readStream((apiCode >= 200 && apiCode < 300) ? conn.getInputStream() : conn.getErrorStream());
             consoleLog("INFO", "ApiCheckServlet: [SYNC] response code: " + apiCode + ", data length: " + (apiData != null ? apiData.length() : "null"));
-
+            
         } catch (java.net.SocketTimeoutException e) {
+            consoleLog("timeout: " + e.getMessage());
             errorMsg = "timeout: " + e.getMessage();
-        } catch (java.net.ConnectException e) {
+            apiData = "{\"error\": \"" + e.getLocalizedMessage() + "\"}";
+        } catch (java.net.ConnectException e) {   
             errorMsg = "connection_refused: " + e.getMessage();
-        } catch (IOException e) {
+            apiData = "{\"error\": \"" + e.getLocalizedMessage() + "\"}";
+        } catch (IOException e) {  
             errorMsg = "io_error: " + e.getMessage();
+            apiData = "{\"error\": \"" + e.getLocalizedMessage() + "\"}";
         } catch (Exception e) {
             errorMsg = e.getClass().getSimpleName() + ": " + e.getMessage();
+            apiData = "{\"error\": \"" + e.getLocalizedMessage() + "\"}";
         } finally {
+            
             if (conn != null) {
                 conn.disconnect();
             }
             activeCallCount.decrementAndGet();
         }
 
-        long durationMs = System.currentTimeMillis() - startTime;
-
+        if (apiData == null) {
+            consoleLog("INFO", "ApiCheckServlet: [SYNC] '" + tc.name + "' API call finished with code " + apiCode
+                    + (errorMsg != null ? " and error: " + errorMsg : ""));
+            apiData = "{error}";
+        }
         // Update log context
         ctx.setTarget(tc.name, tc.apiUrl, tc.httpMethod, tc.subType, "SYNC")
-           .setResults(apiCode, errorMsg, apiData, durationMs);
-           
-
+           .setResults(apiCode, errorMsg, apiData);
+            
         // Build response by API type (each api has specific response format, return raw data and code for now)
         buildApiResponse(tc, response, out, ctx);  
         out.flush();
-
-        
-
         ctx.setResult((errorMsg == null || errorMsg.length() == 0)? true : false, ctx.result);
 
         // Log to a log database asynchronously to avoid slowing down the response.
         final LogContext finalCtx = ctx;
         logCallAsync(finalCtx);
+
+        long durationMs = System.currentTimeMillis() - startTime;
         consoleLog("ApiCheckServlet: [SYNC] '" + tc.name + "' finished in " + durationMs + " ms" + " code=" + apiCode
                 + (errorMsg != null ? " error=" + errorMsg : ""));
-
     }
 
     // ========================================================================
@@ -425,7 +430,7 @@ public class ApiCheckServlet extends HttpServlet {
     // ========================================================================
 
     private void buildApiResponse(TargetConfig tc, HttpServletResponse response, PrintWriter out, LogContext ctx) {
-        
+       
         // get used memory
         Runtime runtime = Runtime.getRuntime();
         // long maxMemory = runtime.maxMemory();        // -Xmx (Maximum possible heap)
@@ -445,13 +450,14 @@ public class ApiCheckServlet extends HttpServlet {
         response.setDateHeader("Expires", 0);
 
         StringBuilder json;
+        
         switch (tc.subType) {
         case "TeamViewer":
         case "TeamViewerAPI for PRTG REST Custom V2":
             json = buildTeamViewerResponseV2(ctx, usedMemory);  
             break;
         case "TeamViewerAPI for PRTG REST JSON DATA":
-            json = buildTeamViewerResponseV3(ctx,  usedMemory);  
+            json = buildTeamViewerResponseV3(tc, ctx,  usedMemory);  
             break;
         default:
             json = new StringBuilder();
@@ -459,7 +465,7 @@ public class ApiCheckServlet extends HttpServlet {
             json.append("\"target\":\"").append(escapeJson(tc.name)).append("\"");
             json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
             json.append(",\"mode\":\"sync\"");
-            json.append(",\"durationMs\":").append(ctx.durationMs);
+            json.append(",\"durationMs\":").append(ctx.getDurationMs());
             json.append(",\"JVM used memory\":").append(usedMemory);
 
             if (ctx.errorMsg != null) {
@@ -481,11 +487,12 @@ public class ApiCheckServlet extends HttpServlet {
             response.setContentLength(json.toString().getBytes("UTF-8").length);
         } catch (UnsupportedEncodingException e) {
             consoleLog("ApiCheckServlet: [WARN] UTF-8 encoding not supported, cannot set content length");
-        }
+        }   
         out.print(json.toString());
     }
 
     private StringBuilder buildTeamViewerResponseV2(LogContext ctx, long usedMemory) {
+       
         StringBuilder json = new StringBuilder();
 
         // Regex logic: Find "online_state" and capture the value between quotes
@@ -494,16 +501,14 @@ public class ApiCheckServlet extends HttpServlet {
         // 2. \s*:\s* handles potential whitespace around the colon
         // 3. \"([^\"]*)\" captures everything inside the following quotes
         Pattern pattern = Pattern.compile("\"online_state\"\\s*:\\s*\"([^\"]*)\"");
-        // Pattern pattern = Pattern.compile("\"online_state\"\s*:\s*\"([^\"]*)\"");
         Matcher matcher = pattern.matcher(ctx.apiData);
         String device_status = "Unknown";
         if (matcher.find()) {
            device_status = matcher.group(1);
         }
 
-        // Reexx logic to extract teamviewer_id
+        // Regex logic to extract teamviewer_id
         pattern = Pattern.compile("\"teamviewer_id\"\\s*:\\s*(\\d+)");
-        // pattern = Pattern.compile("\"teamviewer_id\"\s*:\s*(\d+)");
         matcher = pattern.matcher(ctx.apiData);
         String tv_Id = "-1";
         if (matcher.find()) {
@@ -517,16 +522,14 @@ public class ApiCheckServlet extends HttpServlet {
                 .append("{\"channel\":\"TeamViewerID\",\"value\":")
                 .append(tv_Id).append("},")
                 .append("{\"channel\":\"ResponseTime\",\"value\":")
-                .append(ctx.durationMs).append("},")
+                .append(ctx.getDurationMs()).append("},")
                 .append("{\"channel\":\"JVM used memory\",\"value\":")
                 .append(usedMemory).append("}")
-                .append("]}}");
-        
-        return json;
-        
+                .append("]}}");   
+        return json; 
     }
 
-   private StringBuilder buildTeamViewerResponseV3(LogContext ctx, long usedMemory) {
+   private StringBuilder buildTeamViewerResponseV3(TargetConfig tc, LogContext ctx, long usedMemory) {
         StringBuilder json = new StringBuilder();
 
         // Regex logic: Find "online_state" and capture the value between quotes
@@ -535,54 +538,66 @@ public class ApiCheckServlet extends HttpServlet {
         // 2. \s*:\s* handles potential whitespace around the colon
         // 3. \"([^\"]*)\" captures everything inside the following quotes
         Pattern pattern = Pattern.compile("\"online_state\"\\s*:\\s*\"([^\"]*)\"");
-        // Pattern pattern = Pattern.compile("\"online_state\"\s*:\s*\"([^\"]*)\"");
         Matcher matcher = pattern.matcher(ctx.apiData);
         String device_status = "Unknown";
+        String senzorMsg = "TV ID: Unknown";
         if (matcher.find()) {
            device_status = matcher.group(1);
         }
 
         // Regex logic to extract teamviewer_id
         pattern = Pattern.compile("\"teamviewer_id\"\\s*:\\s*(\\d+)");
-        // pattern = Pattern.compile("\"teamviewer_id\"\s*:\s*(\d+)");
         matcher = pattern.matcher(ctx.apiData);
         String tv_Id = "-1";
         if (matcher.find()) {
             tv_Id = matcher.group(1);
+            senzorMsg = "TV ID: " + tv_Id;
         }
 
-        // Status PRTG Statuses: Up status: OK, Warning status: Warning, Down status: Error, Unknown status: Unknown
-        String statusString = "Unknown";
+        // Status PRTG Statuses: Up status: ok, warning status: warning, Down status: error, Unknown status: warning
+        String statusString = "warning";
         switch (device_status) {
             case "Online":
-                statusString = (ctx.durationMs > 10000) ? "Warning" : "OK";
+                statusString = (ctx.getDurationMs() > 5000) ? "warning" : "ok";
+                senzorMsg = senzorMsg + " is Online" + ((ctx.getDurationMs() > 5000) ? ", but slow": "");
                 break;
             case "Offline":
-                statusString = "Error";
+                statusString = "error";
+                senzorMsg = senzorMsg + " is Offline.";
                 break;
             case "Unknown":
-                statusString = "Unknown";
+                statusString = "warning";
+                senzorMsg = senzorMsg + " is Unknown.";
                 break;
             default:
-                statusString = "Unknown";
+                statusString = "warning";
+                senzorMsg = senzorMsg + " Status: " + device_status;
+                 break;
         }
         
         json.append("{")
                 .append("\"version\":3,")
                 .append("\"status\":\"").append(statusString).append("\",")
-                .append("\"message\":\"TeamViewer status (ID: ").append(tv_Id).append(")\",")
+                .append("\"message\":\"").append(senzorMsg).append("\",")
                 .append("\"channels\":[")
                     .append("{\"id\":10,")
-                    .append("\"name\":\"Availability\",")
-                    .append("\"type\":\"integer\",")
-                    .append("\"kind\":\"count\",")
-                    .append("\"value\":").append(device_status.equals("Online") ? "1" : "0").append("},")
+                    .append("\"name\":\"Availability\",");
+
+        // If a lookup name is provided in the config, use "lookup" type with that name. Otherwise, default to "integer" type with "custom" kind.
+        if (tc.prtg_LookupName != null && tc.prtg_LookupName.length() > 0) {
+                json.append("\"type\": \"lookup\",")
+                    .append("\"lookup_name\":\"").append(escapeJson(tc.prtg_LookupName)).append("\",");
+        } else {
+                json.append("\"type\":\"integer\",")
+                    .append("\"kind\":\"custom\",");
+        }
+                json.append("\"value\":").append(device_status.equals("Online") ? "1" : "0").append("},")
         
                     .append("{\"id\":11,")
                     .append("\"name\":\"Response Time\",")
                     .append("\"type\":\"float\",")
                     .append("\"kind\":\"time_milliseconds\",")
-                    .append("\"value\":").append(ctx.durationMs).append("},")
+                    .append("\"value\":").append(ctx.getDurationMs()).append("},")
 
                     .append("{\"id\":12,")
                     .append("\"name\":\"JVM Heap Memory\",")
@@ -601,11 +616,9 @@ public class ApiCheckServlet extends HttpServlet {
     }
 
     private void setRequestProperties(HttpURLConnection conn, TargetConfig tc) throws Exception {
-
-        // Set timeouts and method
         conn.setRequestMethod(tc.httpMethod);
-        conn.setConnectTimeout(tc.connectTimeoutSec * 1000);
-        conn.setReadTimeout(tc.readTimeoutSec * 1000);
+        conn.setConnectTimeout((tc.connectTimeoutSec * 1000) + 100);
+        conn.setReadTimeout((tc.readTimeoutSec * 1000) + 100);
 
         // Set headers
         if (tc.authHeader != null && tc.authHeader.length() > 0) {
@@ -818,7 +831,7 @@ public class ApiCheckServlet extends HttpServlet {
         json.append(",\"activeCalls\":").append(activeCallCount.get());
         json.append(",\"configuredTargets\":").append(targets.size());
         json.append(",\"maxBgThreads\":").append(MAX_BG_THREADS);
-
+       
         // Per-target cache status
         json.append(",\"targets\":[");
         boolean first = true;
@@ -831,8 +844,9 @@ public class ApiCheckServlet extends HttpServlet {
             Boolean running = inProgress.get(entry.getKey());
 
             json.append("{\"name\":\"").append(escapeJson(tc.name)).append("\"");
-            json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
+            json.append(",\"apiSubType\":\"").append(escapeJson(tc.subType)).append("\"");
             json.append(",\"mode\":\"").append(tc.useCachedMode ? "cached" : "sync").append("\"");
+            json.append(",\"timeout\":").append(tc.connectTimeoutSec + tc.readTimeoutSec);
             json.append(",\"bgRunning\":").append(Boolean.TRUE.equals(running));
             if (cr != null) {
                 long age = (System.currentTimeMillis() - cr.timestamp) / 1000;
@@ -850,14 +864,27 @@ public class ApiCheckServlet extends HttpServlet {
             json.append("}");
         }
         json.append("]");
+
+        // Blocked IP patterns
+        json.append(",\"blockedIpPatterns\":[");
+        first = true;
+        for (Pattern p : blockedIpPatterns) {
+            if (!first)
+                json.append(",");
+            first = false;
+            json.append("\"").append(escapeJson(p.pattern())).append("\"");
+        }
+        if (first) {json.append("\"none\"");};
+        json.append("]");
         json.append("}");
 
         out.print(json.toString());
         out.flush();
 
-        ctx.setTarget("APICheckServlet", "N/A", "N/A", "Status", "0");
-        ctx.setResults(200, "",json.toString(), 0);
-        ctx.setResult(true, "Show servlet status");
+        ctx.setTarget("APICheckServlet", "N/A", "N/A", "Status", "0")
+            .setResults(200, "",json.toString())
+            .setResult(true, "Show servlet status");
+
         // make it final for thread use
         final LogContext finalCtx = ctx;
         logCallAsync(finalCtx);
@@ -873,7 +900,7 @@ public class ApiCheckServlet extends HttpServlet {
         out.flush();
 
         ctx.setTarget("APICheckServlet", "N/A", "N/A", "Reload", "0");
-        ctx.setResults(200, "", "Reloaded " + count + " targets.", 0);
+        ctx.setResults(200, "", "Reloaded " + count + " targets.");
         ctx.setResult(true, "Reload servlet configuration");
 
         // make it final for thread use
@@ -915,13 +942,11 @@ public class ApiCheckServlet extends HttpServlet {
             } 
 
             loadBlockeIPList(profile);
-
-
             recycleQuietly(profile);
             
-            view = db.getView("()");
+            view = db.getView("($APIChecksActiveTargets)");
             if (view == null) {
-                consoleLog("ApiCheckServlet: ERROR — View '()' " + "not found in " + configDb);
+                consoleLog("ApiCheckServlet: ERROR — View '($APIChecksActiveTargets)' " + "not found in " + configDb);
                 return 0;
             }
 
@@ -936,6 +961,7 @@ public class ApiCheckServlet extends HttpServlet {
                     tc.apiUrl = getItemString(doc, "ApiUrl");
                     tc.httpMethod = getItemString(doc, "HttpMethod");
                     tc.authHeader = getItemString(doc, "AuthHeader");
+                    tc.prtg_LookupName = getItemString(doc, "PRTG_Availability_LookupName");
 
                     if (tc.httpMethod == null || tc.httpMethod.length() == 0) {
                         tc.httpMethod = "GET";
@@ -999,22 +1025,29 @@ public class ApiCheckServlet extends HttpServlet {
     }
 
     private void loadBlockeIPList(Document profile) throws NotesException {
-      Vector<?> rawValues = profile.getItemValue("IPs_Blocked");
+        Vector<?> rawValues = profile.getItemValue("IPs_Blocked");
+
+        // Create a temporary local list to avoid partial updates to the shared list
+        List<Pattern> newList = new java.util.ArrayList<>();
         for (Object val : rawValues) {
             String entry = (val != null) ? val.toString().trim() : "";
-            if (entry.isEmpty()) continue;
+            if (entry.isEmpty())
+                continue;
 
             // Handle potential comma-separated values within a single Vector element
             String[] parts = entry.split(",");
             for (String part : parts) {
                 try {
                     // Compile once and store in memory
-                    blockedIpPatterns.add(Pattern.compile(part.trim()));
+                    newList.add(Pattern.compile(part.trim()));
                 } catch (PatternSyntaxException e) {
                     consoleLog("ApiCheckServlet: [WARN] - Invalid Regex ignored: " + part);
                 }
             }
         }
+
+        // Atomic update: replaces the reference so active doGet threads aren't interrupted
+        this.blockedIpPatterns = new java.util.concurrent.CopyOnWriteArrayList<>(newList);
     }
 
     // ========================================================================
@@ -1052,20 +1085,21 @@ public class ApiCheckServlet extends HttpServlet {
             doc.replaceItemValue("CallTimestamp", dt);
 
             doc.replaceItemValue("TargetName", ctx.targetName);
-            doc.replaceItemValue("SubType", ctx.action);
+            doc.replaceItemValue("ApiSubType", ctx.targetApiVersion);
             doc.replaceItemValue("ApiUrl", ctx.targetApiUrl);
             doc.replaceItemValue("Mode", ctx.mode);
 
             doc.replaceItemValue("Caller_UserAgent", ctx.userAgent);
             doc.replaceItemValue("Caller_IPAddress", ctx.ipAddress);
             doc.replaceItemValue("Caller_Method", ctx.httpMethod);
-
+            doc.replaceItemValue("Action", ctx.action);
             
             doc.replaceItemValue("HttpCode", ctx.httpCode);
-            doc.replaceItemValue("DurationMs", ctx.durationMs);
+            doc.replaceItemValue("DurationMs", System.currentTimeMillis() - ctx.startTime);
             
             doc.replaceItemValue("ProcessedTimestamp", session.createDateTime(new Date()));
-
+            doc.replaceItemValue("ApiPayload", ctx.apiData != null ? ctx.apiData : ""); 
+           
             if (ctx.isCachedResponseUsed) {
                 doc.replaceItemValue("CachedResponseUsed", "1");
                 if (ctx.cacheResponseTime > 0) {
@@ -1076,7 +1110,7 @@ public class ApiCheckServlet extends HttpServlet {
 
             doc.replaceItemValue("ActiveCalls", activeCallCount.get());
 
-            if (ctx.errorMsg != null) {
+            if (ctx.errorMsg != null && ctx.errorMsg.length() > 0) {
                 doc.replaceItemValue("ErrorMsg", ctx.errorMsg);
                 doc.replaceItemValue("Success", "0");
             }
@@ -1084,7 +1118,8 @@ public class ApiCheckServlet extends HttpServlet {
                 doc.replaceItemValue("ErrorMsg", "");
                 doc.replaceItemValue("Success", "1");
             }
-            doc.replaceItemValue("ApiPayload", ctx.apiData != null ? ctx.apiData : ""); 
+            doc.replaceItemValue("Result", ctx.result );
+
             doc.save(true, false);
 
         } catch (Exception e) {
@@ -1161,15 +1196,13 @@ public class ApiCheckServlet extends HttpServlet {
     /** Get integer item from Notes document with default */
     private static int getItemInt(lotus.domino.Document doc, String itemName, int defaultVal) {
         try {
-            String val = doc.getItemValueString(itemName);
-            if (val != null && val.length() > 0) {
-                return (int) Long.parseLong(val.trim());
-            }
+            return doc.getItemValueInteger(itemName);
         } catch (Exception e) {
             // ignore parse errors
         }
         return defaultVal;
     }
+
 
     /** Build JSON array of target names */
     private String targetListJson() {

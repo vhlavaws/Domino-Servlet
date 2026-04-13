@@ -31,6 +31,9 @@ public class TargetConfig {
     /** Additional HTTP headers: key=header name, value=header value */
     public Map<String, String> customHeaders;
 
+    /** Specific properties for each target type */
+    public String prtg_LookupName = "";
+
     /** TCP connect timeout in seconds */
     public int connectTimeoutSec = 60;
 

@@ -16,7 +16,7 @@ public class LogContext {
    // Response properties
    public String errorMsg, apiData;
    public int httpCode;
-   public long durationMs;
+  
    String result = ""; // "success", "error", "cached", etc. - for easier querying/logging
    String success = "0";
 
@@ -65,16 +65,10 @@ public class LogContext {
       return this;
    }
 
-   public LogContext setDurationMs(long val) {
-      this.durationMs = val;
-      return this;
-   }
-
    public LogContext setErrorMsg(String val) {
       this.errorMsg = val;
       return this;
    }
-
 
    public LogContext setAsync(boolean val) {
       this.isAsync = val;
@@ -96,11 +90,10 @@ public class LogContext {
       return this;
    }
 
-   public LogContext setResults(int httpCode, String errMsg, String apiData, long durationMs) {
+   public LogContext setResults(int httpCode, String errMsg, String apiData) {
       this.httpCode = httpCode;
       this.errorMsg = errMsg;
-      this.apiData = apiData;
-      this.durationMs = durationMs;
+      this.apiData = apiData; 
       if (errMsg != null && errMsg.length() > 0) {
          this.result = "error";
          this.success = "0";
@@ -115,6 +108,10 @@ public class LogContext {
          this.success = isSuccess ? "1" : "0";
          this.result = result;
          return this;
+   }
+
+   public long getDurationMs() {
+      return System.currentTimeMillis() - this.startTime;
    }
 
 }
