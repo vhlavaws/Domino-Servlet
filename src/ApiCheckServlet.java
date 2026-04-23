@@ -215,6 +215,7 @@ public class ApiCheckServlet extends HttpServlet {
                 return;
             }
         }
+
         
         // --- Action routing ---
         if ("status".equalsIgnoreCase(action)) {
@@ -226,17 +227,30 @@ public class ApiCheckServlet extends HttpServlet {
             return;
         }
 
-        // --- Target check ---
+        // Target check 
         if (targetName == null || targetName.length() == 0) {
             response.setStatus(400);
             out.print("{\"error\":\"missing 'target' parameter\"}");
             out.flush();
-            //TODO handle missing target
             return;
         }
 
+        // Target routing: Request comes with params: action=TeamViewerAPIv3&target=d1599914075&key=secret
+        // 1. Get configuration based on target match, e.g. "d1599914075" -> "d1599914075" config
+        // 2. Failover: Get configuration based on action match: action=TeamViewerAPIv3 -> get "TeamViewerAPIv3" config
+        // returns null if no match, so it falls back to 404 error below
         TargetConfig tc = targets.get(targetName.toLowerCase());
+
+        // Failover: Use "action" param as fallback for target lookup (for better compatibility with existing monitoring setups that use "target" param for different instances of the same API type, e.g. multiple TeamViewer accounts)
         if (tc == null) {
+            tc = targets.get(action.toLowerCase());
+            if ( tc != null ) {
+                 tc.apiUrl = tc.apiUrl.replace("{target}", targetName);
+                 consoleLog("INFO", "ApiCheckServlet: No direct match for target '" + targetName + "'. Using config for action '" + action + "' as fallback.");
+            }       
+        }  
+
+        if (tc == null) {              
             response.setStatus(404);
             out.print("{\"error\":\"unknown target: " + escapeJson(targetName) + "\", \"availableTargets\":"
                     + targetListJson() + "}");
@@ -659,23 +673,21 @@ public class ApiCheckServlet extends HttpServlet {
         }
 
         // Wait up to cacheWaitSec for fresh result
-        if (startedNew) {
-            long waitUntil = System.currentTimeMillis() + (tc.cacheWaitSec * 1000L);
-
-            synchronized (lock) {
-                while (Boolean.TRUE.equals(inProgress.get(key)) && System.currentTimeMillis() < waitUntil) {
-                    try {
-                        long remaining = waitUntil - System.currentTimeMillis();
-                        if (remaining > 0) {
-                            lock.wait(remaining);
-                        }
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        break;
+        long waitUntil = System.currentTimeMillis() + (tc.cacheWaitSec * 1000L);
+        synchronized (lock) {
+            while (Boolean.TRUE.equals(inProgress.get(key)) && System.currentTimeMillis() < waitUntil) {
+                try {
+                    long remaining = waitUntil - System.currentTimeMillis();
+                    if (remaining > 0) {
+                        lock.wait(remaining);
                     }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
         }
+        
 
         // Build response from cache
         CachedResult cr = cache.get(key);
