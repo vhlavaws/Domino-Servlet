@@ -426,7 +426,7 @@ public class ApiCheckServlet extends HttpServlet {
            .setResults(apiCode, errorMsg, apiData);
             
         // Build response by API type (each api has specific response format, return raw data and code for now)
-        buildApiResponse(tc, response, out, ctx);  
+        buildApiResponse(tc, response, out, ctx, false, null, 0, null);  
         out.flush();
         ctx.setResult((errorMsg == null || errorMsg.length() == 0)? true : false, ctx.result);
 
@@ -439,11 +439,9 @@ public class ApiCheckServlet extends HttpServlet {
                 + (errorMsg != null ? " error=" + errorMsg : ""));
     }
 
-    // ========================================================================
-    // CACHED TARGET HANDLING (TeamViewer — slow API)
-    // ========================================================================
 
-    private void buildApiResponse(TargetConfig tc, HttpServletResponse response, PrintWriter out, LogContext ctx) {
+
+    private void buildApiResponse(TargetConfig tc, HttpServletResponse response, PrintWriter out, LogContext ctx, boolean bgRunning, String cachedStatus, long ageSeconds, String lastUpdate) {
        
         // get used memory
         Runtime runtime = Runtime.getRuntime();
@@ -478,9 +476,22 @@ public class ApiCheckServlet extends HttpServlet {
             json.append("{");
             json.append("\"target\":\"").append(escapeJson(tc.name)).append("\"");
             json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
-            json.append(",\"mode\":\"sync\"");
+            json.append(",\"mode\":\"").append(tc.useCachedMode ? "cached" : "sync").append("\"");
             json.append(",\"durationMs\":").append(ctx.getDurationMs());
             json.append(",\"JVM used memory\":").append(usedMemory);
+
+            if (tc.useCachedMode) {
+                json.append(",\"bgRunning\":").append(bgRunning);
+                if (cachedStatus != null) {
+                    json.append(",\"status\":\"").append(cachedStatus).append("\"");
+                }
+                if (ageSeconds > 0) {
+                    json.append(",\"ageSeconds\":").append(ageSeconds);
+                }
+                if (lastUpdate != null) {
+                    json.append(",\"lastUpdate\":\"").append(lastUpdate).append("\"");
+                }
+            }
 
             if (ctx.errorMsg != null) {
                 json.append(",\"status\":\"error\"");
@@ -649,7 +660,8 @@ public class ApiCheckServlet extends HttpServlet {
     }
 
     /**
-     * For slow APIs: start background call, wait up to N seconds for fresh result. If not ready, return
+     * CACHED TARGET HANDLING
+     * For slow APIs (e.g., TeamViewer): start background call, wait up to N seconds for fresh result. If not ready, return
      * last cached result. Background thread continues until API responds or total timeout.
      */
     private void handleCachedTarget(TargetConfig tc, HttpServletResponse response, PrintWriter out, LogContext ctx) {
@@ -662,12 +674,10 @@ public class ApiCheckServlet extends HttpServlet {
         Object lock = inProgressLocks.get(key);
 
         // Start background call if not already running
-        boolean startedNew = false;
         synchronized (lock) {
             Boolean running = inProgress.get(key);
             if (running == null || !running) {
                 inProgress.put(key, Boolean.TRUE);
-                startedNew = true;
                 bgExecutor.submit(new BackgroundApiCaller(tc, key, lock));
             }
         }
@@ -696,42 +706,36 @@ public class ApiCheckServlet extends HttpServlet {
             bgRunning = Boolean.TRUE.equals(inProgress.get(key));
         }
 
-        response.setStatus(200);
-        StringBuilder json = new StringBuilder();
-        json.append("{");
-        json.append("\"target\":\"").append(escapeJson(tc.name)).append("\"");
-        json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
-        json.append(",\"mode\":\"cached\"");
-        json.append(",\"bgRunning\":").append(bgRunning);
-
         if (cr == null) {
+            response.setStatus(200);
+            StringBuilder json = new StringBuilder();
+            json.append("{");
+            json.append("\"target\":\"").append(escapeJson(tc.name)).append("\"");
+            json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
+            json.append(",\"mode\":\"cached\"");
+            json.append(",\"bgRunning\":").append(bgRunning);
             json.append(",\"status\":\"no_data_yet\"");
             json.append(",\"message\":\"First call in progress, " + "no cached result available\"");
+            json.append(",\"activeCalls\":").append(activeCallCount.get());
+            json.append(",\"timestamp\":\"").append(utcNow()).append("\"");
+            json.append("}");
+
+            out.print(json.toString());
+            out.flush();
         }
         else {
             long ageSeconds = (System.currentTimeMillis() - cr.timestamp) / 1000;
             boolean isFresh = (ageSeconds < 30);
+            String cachedStatus = isFresh ? "fresh" : "cached";
 
-            json.append(",\"status\":\"").append(isFresh ? "fresh" : "cached").append("\"");
-            json.append(",\"ageSeconds\":").append(ageSeconds);
-            json.append(",\"lastUpdate\":\"").append(formatTimestamp(cr.timestamp)).append("\"");
-            json.append(",\"lastDurationMs\":").append(cr.durationMs);
+            // Set ctx for buildApiResponse
+            ctx.setTarget(tc.name, tc.apiUrl, tc.httpMethod, tc.subType, "CACHED");
+            ctx.setResults(cr.httpCode, cr.errorMsg, cr.data);
+            ctx.setDurationMs(cr.durationMs);
 
-            if (cr.errorMsg != null) {
-                json.append(",\"lastError\":\"").append(escapeJson(cr.errorMsg)).append("\"");
-            }
-            else {
-                json.append(",\"apiResponseCode\":").append(cr.httpCode);
-                json.append(",\"data\":").append(cr.data != null ? cr.data : "null");
-            }
+            buildApiResponse(tc, response, out, ctx, bgRunning, cachedStatus, ageSeconds, formatTimestamp(cr.timestamp));
+            out.flush();
         }
-
-        json.append(",\"activeCalls\":").append(activeCallCount.get());
-        json.append(",\"timestamp\":\"").append(utcNow()).append("\"");
-        json.append("}");
-
-        out.print(json.toString());
-        out.flush();
     }
 
     // ========================================================================

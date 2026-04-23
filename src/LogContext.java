@@ -16,6 +16,7 @@ public class LogContext {
    // Response properties
    public String errorMsg, apiData;
    public int httpCode;
+   public long durationMs = 0;
   
    String result = ""; // "success", "error", "cached", etc. - for easier querying/logging
    String success = "0";
@@ -85,8 +86,8 @@ public class LogContext {
       return this;
    }
 
-   public LogContext setApiData(String val) {
-      this.apiData = val;
+   public LogContext setDurationMs(long val) {
+      this.durationMs = val;
       return this;
    }
 
@@ -111,7 +112,7 @@ public class LogContext {
    }
 
    public long getDurationMs() {
-      return System.currentTimeMillis() - this.startTime;
+      return durationMs > 0 ? durationMs : System.currentTimeMillis() - this.startTime;
    }
 
 }
