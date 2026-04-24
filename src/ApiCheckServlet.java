@@ -399,15 +399,22 @@ public class ApiCheckServlet extends HttpServlet {
             consoleLog("timeout: " + e.getMessage());
             errorMsg = "timeout: " + e.getMessage();
             apiData = "{\"error\": \"" + e.getLocalizedMessage() + "\"}";
+           
+
         } catch (java.net.ConnectException e) {   
             errorMsg = "connection_refused: " + e.getMessage();
             apiData = "{\"error\": \"" + e.getLocalizedMessage() + "\"}";
+           
+
         } catch (IOException e) {  
             errorMsg = "io_error: " + e.getMessage();
             apiData = "{\"error\": \"" + e.getLocalizedMessage() + "\"}";
+            
+
         } catch (Exception e) {
             errorMsg = e.getClass().getSimpleName() + ": " + e.getMessage();
             apiData = "{\"error\": \"" + e.getLocalizedMessage() + "\"}";
+
         } finally {
             
             if (conn != null) {
@@ -450,8 +457,17 @@ public class ApiCheckServlet extends HttpServlet {
         long freeMemory = runtime.freeMemory();         // Free space WITHIN the allocated heap   
         long usedMemory = allocatedMemory - freeMemory; // The actual memory used by objects
 
-        // Set common response headers
-        response.setStatus(200);
+        // HTTP Status based on error
+        int status = 200;
+        if (ctx.errorMsg != null) {
+            if (ctx.errorMsg.startsWith("timeout") || ctx.errorMsg.startsWith("connection_refused")) {
+                status = 503;
+            } else {
+                status = 500;
+            }
+        }
+        response.setStatus(status);
+
         // Set content type and caching headers
         response.setContentType("application/json; charset=UTF-8");
         // Prevent caching for HTTP 1.1
