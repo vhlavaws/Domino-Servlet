@@ -263,7 +263,7 @@ public class ApiCheckServlet extends HttpServlet {
         
 
         if (tc.useCachedMode) {
-            handleCachedTarget(tc, response, out, ctx);
+            handleCachedTarget(tc, targetName, response, out, ctx);
         }
         else {
             handleSyncTarget(tc, response, out, ctx);
@@ -680,10 +680,9 @@ public class ApiCheckServlet extends HttpServlet {
      * For slow APIs (e.g., TeamViewer): start background call, wait up to N seconds for fresh result. If not ready, return
      * last cached result. Background thread continues until API responds or total timeout.
      */
-    private void handleCachedTarget(TargetConfig tc, HttpServletResponse response, PrintWriter out, LogContext ctx) {
+    private void handleCachedTarget(TargetConfig tc, String targetID, HttpServletResponse response, PrintWriter out, LogContext ctx) {
 
-        //TODO - REFACTOR AND IMPLEMENT AND TEST
-        String key = tc.name.toLowerCase();
+        String key = tc.name.toLowerCase() + "_" + targetID.toLowerCase();
 
         // Ensure lock object exists for this target
         inProgressLocks.putIfAbsent(key, new Object());
@@ -839,7 +838,7 @@ public class ApiCheckServlet extends HttpServlet {
             // Log
             logCallAsync(ctx);
 
-            consoleLog("ApiCheckServlet: [CACHED-BG] '" + tc.name + "' finished in " + durationMs + "ms" + " code="
+            consoleLog("ApiCheckServlet: [CACHED-BG] '" + cacheKey + "' finished in " + durationMs + "ms" + " code="
                     + apiCode + (errorMsg != null ? " error=" + errorMsg : ""));
 
             // Signal waiting servlet thread
@@ -863,6 +862,8 @@ public class ApiCheckServlet extends HttpServlet {
         json.append(",\"activeCalls\":").append(activeCallCount.get());
         json.append(",\"configuredTargets\":").append(targets.size());
         json.append(",\"maxBgThreads\":").append(MAX_BG_THREADS);
+        json.append(",\"cacheResultEntries\":").append(cache.size());
+        json.append(",\"cacheResultMemorySize\":").append(estimateCacheSizeBytes());
        
         // Per-target cache status
         json.append(",\"targets\":[");
@@ -1259,4 +1260,30 @@ public class ApiCheckServlet extends HttpServlet {
                 /* ignore */ }
         }
     }
+
+    /** Estimate cache size in bytes (rough approximation for monitoring) */
+private long estimateCacheSizeBytes() {
+    long totalBytes = 0;
+    for (Map.Entry<String, CachedResult> entry : cache.entrySet()) {
+        // Key (String)
+        String key = entry.getKey();
+        totalBytes += (key != null ? 40 + (key.length() * 2) : 0);
+        
+        // Value (CachedResult)
+        CachedResult cr = entry.getValue();
+        if (cr != null) {
+            totalBytes += 16; // Object overhead
+            totalBytes += 4;  // int httpCode
+            totalBytes += 8;  // long durationMs
+            totalBytes += 8;  // long timestamp
+            // Strings
+            totalBytes += (cr.data != null ? 40 + (cr.data.length() * 2) : 0);
+            totalBytes += (cr.errorMsg != null ? 40 + (cr.errorMsg.length() * 2) : 0);
+        }
+        
+        // Map entry overhead
+        totalBytes += 32;
+    }
+    return totalBytes;
+}
 }
