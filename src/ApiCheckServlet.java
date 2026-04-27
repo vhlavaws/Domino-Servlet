@@ -18,6 +18,7 @@ import java.io.InputStreamReader;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.List;
@@ -25,13 +26,20 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TimeZone;
 import java.util.Vector;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutionException;
+
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
+
 
 /**
  * ApiCheckServlet — Multi-target API monitoring servlet for HCL Domino.
@@ -355,13 +363,7 @@ public class ApiCheckServlet extends HttpServlet {
             URL url = new URL(tc.apiUrl);
             conn = (HttpURLConnection) url.openConnection();
 
-            if (conn instanceof HttpsURLConnection) {
-                SSLContext sc = SSLContext.getInstance("TLSv1.2");
-                sc.init(null, null, new java.security.SecureRandom());
-                ((HttpsURLConnection) conn).setSSLSocketFactory(sc.getSocketFactory());
-                consoleLog("INFO", "ApiCheckServlet: [SYNC] '" + tc.name + "' using HTTPS with TLSv1.2");
-            }
-            setRequestProperties(conn, tc);
+            setupConnection(conn, tc);
             apiCode = conn.getResponseCode();
 
             // Handle HTTP redirects manually to preserve headers (for http->https case)
@@ -377,18 +379,7 @@ public class ApiCheckServlet extends HttpServlet {
 
                 URL next = new URL(newUrl);
                 conn = (HttpURLConnection) next.openConnection();
-
-                if (conn instanceof HttpsURLConnection) {
-                    SSLContext sc = SSLContext.getInstance("TLSv1.2");
-                    sc.init(null, null, new java.security.SecureRandom());
-                    ((HttpsURLConnection) conn).setSSLSocketFactory(sc.getSocketFactory());
-                    consoleLog("INFO", "ApiCheckServlet: [SYNC] '" + tc.name + "' using HTTPS with TLSv1.2 after redirect");
-                }
-
-                // Re-apply timeouts, method, and headers for the new connection, 
-                // TODO: timeouts should ideally be subtracted by the time already spent on the first call
-                setRequestProperties(conn, tc);
-
+                setupConnection(conn, tc);
                 apiCode = conn.getResponseCode();
             }
 
@@ -656,8 +647,17 @@ public class ApiCheckServlet extends HttpServlet {
         return json;  
     }
 
-    private void setRequestProperties(HttpURLConnection conn, TargetConfig tc) throws Exception {
+    private void setupConnection(HttpURLConnection conn, TargetConfig tc) throws Exception {
+
+        if (conn instanceof HttpsURLConnection) {
+            SSLContext sc = SSLContext.getInstance("TLSv1.2");
+            sc.init(null, null, new java.security.SecureRandom());
+            ((HttpsURLConnection) conn).setSSLSocketFactory(sc.getSocketFactory());
+            consoleLog("INFO", "ApiCheckServlet: Use HTTPS with TLSv1.2 for '" + tc.name + "'.");
+        }
+
         conn.setRequestMethod(tc.httpMethod);
+
         conn.setConnectTimeout((tc.connectTimeoutSec * 1000) + 100);
         conn.setReadTimeout((tc.readTimeoutSec * 1000) + 100);
 
@@ -722,15 +722,16 @@ public class ApiCheckServlet extends HttpServlet {
         }
 
         if (cr == null) {
-            response.setStatus(200);
+            response.setStatus(503);
             StringBuilder json = new StringBuilder();
             json.append("{");
             json.append("\"target\":\"").append(escapeJson(tc.name)).append("\"");
             json.append(",\"subType\":\"").append(escapeJson(tc.subType)).append("\"");
             json.append(",\"mode\":\"cached\"");
             json.append(",\"bgRunning\":").append(bgRunning);
-            json.append(",\"status\":\"no_data_yet\"");
-            json.append(",\"message\":\"First call in progress, " + "no cached result available\"");
+  
+            json.append(",\"status\":\"error\"");
+            json.append(",\"error\":\"First call in progress, " + "no cached result available\"");
             json.append(",\"activeCalls\":").append(activeCallCount.get());
             json.append(",\"timestamp\":\"").append(utcNow()).append("\"");
             json.append("}");
@@ -773,86 +774,161 @@ public class ApiCheckServlet extends HttpServlet {
 
         @Override
         public void run() {
-            int active = activeCallCount.incrementAndGet();
-            long startTime = System.currentTimeMillis();
-
-            consoleLog(
-                    "ApiCheckServlet: [CACHED-BG] '" + tc.name + "' background call started (active: " + active + ")");
-
-            HttpURLConnection conn = null;
-            int apiCode = 0;
-            String apiData = null;
-            String errorMsg = null;
-
             try {
-                URL url = new URL(tc.apiUrl);
-                conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod(tc.httpMethod);
-                conn.setConnectTimeout(tc.connectTimeoutSec * 1000);
-                conn.setReadTimeout(tc.bgTimeoutSec * 1000);
+                int active = activeCallCount.incrementAndGet();
+                long startTime = System.currentTimeMillis();
 
-                if (tc.authHeader != null && tc.authHeader.length() > 0) {
-                    conn.setRequestProperty("Authorization", tc.authHeader);
+                try {
+                    System.out.println("ApiCheckServlet: [CACHED-BG] '" + cacheKey + "' background call started (active: " + active + ")");
+                    consoleLog("ApiCheckServlet: [CACHED-BG] '" + cacheKey + "' background call started (active: " + active + ")");
+                } catch (Exception logEx) {
+                    System.err.println("Failed to log [CACHED-BG] start: " + logEx.getMessage());
                 }
-                conn.setRequestProperty("Accept", "application/json");
 
-                if (tc.customHeaders != null) {
-                    for (Map.Entry<String, String> h : tc.customHeaders.entrySet()) {
-                        conn.setRequestProperty(h.getKey(), h.getValue());
+                final HttpURLConnection[] connHolder = new HttpURLConnection[1];
+                final int[] apiCodeHolder = new int[1];
+                final String[] apiDataHolder = new String[1];
+
+                String errorMsg = null;
+                int maxTimeoutSec = tc.bgTimeoutSec;
+
+                // Temporary executor for timed call
+                ExecutorService tempExecutor = Executors.newSingleThreadExecutor();
+                Future<Void> future = tempExecutor.submit(new Callable<Void>() {
+                    @Override
+                    public Void call() throws Exception {
+                       
+                        URL url = new URL(tc.apiUrl);
+                        connHolder[0] = (HttpURLConnection) url.openConnection();
+                        setupConnection(connHolder[0], tc);
+                        apiCodeHolder[0] = connHolder[0].getResponseCode();
+                        if (apiCodeHolder[0] == HttpURLConnection.HTTP_MOVED_TEMP
+                                || apiCodeHolder[0] == HttpURLConnection.HTTP_MOVED_PERM || apiCodeHolder[0] == 307
+                                || apiCodeHolder[0] == 308) {
+
+                            String newUrl = connHolder[0].getHeaderField("Location");
+                            consoleLog("ApiCheckServlet: [CACHED-BG] '" + cacheKey + "' redirected to: " + newUrl);
+
+                            connHolder[0].disconnect();
+
+                            URL next = new URL(newUrl);
+                            connHolder[0] = (HttpURLConnection) next.openConnection();
+                            setupConnection(connHolder[0], tc);
+                            apiCodeHolder[0] = connHolder[0].getResponseCode();
+}
+                        apiDataHolder[0] = readStream(
+                                (apiCodeHolder[0] >= 200 && apiCodeHolder[0] < 300) ? connHolder[0].getInputStream()
+                                        : connHolder[0].getErrorStream());
+                        return null;
+                    }
+                });
+
+                try {
+                    // Wait for the call to complete within the total timeout
+                    future.get(maxTimeoutSec, TimeUnit.SECONDS);
+                } catch (TimeoutException e) {
+                    // Total time exceeded - cancel the call and set timeout error
+                    future.cancel(true);
+                    consoleLog("ApiCheckServlet: [CACHED-BG] '" + tc.name + "' total time exceeded " + maxTimeoutSec
+                            + " seconds, cancelling");
+                    errorMsg = "timeout: total request time exceeded " + maxTimeoutSec + " seconds";
+                    apiDataHolder[0] = "{\"error\": \"" + errorMsg + "\"}";
+                } catch (ExecutionException e) {
+                    // Unwrap and handle the actual exception
+                    Throwable cause = e.getCause();
+                    if (cause instanceof java.net.SocketTimeoutException) {
+                        errorMsg = "timeout: " + cause.getMessage();
+                        apiDataHolder[0] = "{\"error\": \"" + cause.getLocalizedMessage() + "\"}";
+                    }
+                    else if (cause instanceof java.net.ConnectException) {
+                        errorMsg = "connection_refused: " + cause.getMessage();
+                        apiDataHolder[0] = "{\"error\": \"" + cause.getLocalizedMessage() + "\"}";
+                    }
+                    else if (cause instanceof IOException) {
+                        errorMsg = "io_error: " + cause.getMessage();
+                        apiDataHolder[0] = "{\"error\": \"" + cause.getLocalizedMessage() + "\"}";
+                    }
+                    else if (cause instanceof Exception) {
+                        errorMsg = cause.getClass().getSimpleName() + ": " + cause.getMessage();
+                        apiDataHolder[0] = "{\"error\": \"" + cause.getLocalizedMessage() + "\"}";
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    errorMsg = "interrupted: " + e.getMessage();
+                    apiDataHolder[0] = "{\"error\": \"" + errorMsg + "\"}";
+                } finally {
+                    // Domino does not allow this: HTTP JVM: Access denied
+                    // add permissionto java.policy file: grant { permission java.lang.RuntimePermission "modifyThread"; };
+                    tempExecutor.shutdownNow();
+
+                    if (connHolder[0] != null) {
+                        try {
+                            connHolder[0].disconnect();
+                        } catch (Exception e) {
+                            System.err.println("[CACHED-BG] Error disconnecting: " + e.getMessage());
+                        }
+                    }
+                    activeCallCount.decrementAndGet();
+                }
+
+                long durationMs = System.currentTimeMillis() - startTime;
+
+                try {
+                    LogContext ctx = new LogContext();
+                    ctx.setCaller("BackgroundThread", "N/A", tc.httpMethod, tc.apiUrl);
+                    ctx.setTarget(tc.name, tc.apiUrl, tc.httpMethod, tc.subType, "CACHED-BG");
+
+                    // Update cache
+                    CachedResult cr = new CachedResult();
+                    cr.httpCode = apiCodeHolder[0];
+                    cr.data = apiDataHolder[0];
+                    cr.errorMsg = errorMsg;
+                    cr.durationMs = durationMs;
+                    cr.timestamp = System.currentTimeMillis();
+                    cache.put(cacheKey, cr);
+
+                    // Log at the end (to not throw exception before response)
+                    try {
+                        logCallAsync(ctx);
+                        consoleLog("ApiCheckServlet: [CACHED-BG] '" + cacheKey + "' finished in " + durationMs + "ms" + " code="
+                                + apiCodeHolder[0] + (errorMsg != null ? " error=" + errorMsg : ""));
+                    } catch (Exception logEx) {
+                        // Logging error should not prevent notifying the waiting thread
+                        System.err.println("ERROR in [CACHED-BG] logging for '" + cacheKey + "': " + logEx.getMessage());
+                        logEx.printStackTrace(System.err);
+                    }
+                } catch (Exception ex) {
+                    // Even if cache update fails, must notify waiting thread
+                    System.err.println("ERROR in [CACHED-BG] cache update for '" + cacheKey + "': " + ex.getMessage());
+                    ex.printStackTrace(System.err);
+                } finally {
+                    // MUST ALWAYS notify waiting servlet thread, regardless of any exceptions
+                    synchronized (lock) {
+                        inProgress.put(cacheKey, Boolean.FALSE);
+                        lock.notifyAll();
                     }
                 }
-
-                apiCode = conn.getResponseCode();
-                apiData = readStream((apiCode >= 200 && apiCode < 300) ? conn.getInputStream() : conn.getErrorStream());
-
-            } catch (java.net.SocketTimeoutException e) {
-                errorMsg = "timeout: " + e.getMessage();
-            } catch (java.net.ConnectException e) {
-                errorMsg = "connection_refused: " + e.getMessage();
-            } catch (IOException e) {
-                errorMsg = "io_error: " + e.getMessage();
-            } catch (Exception e) {
-                errorMsg = e.getClass().getSimpleName() + ": " + e.getMessage();
-            } finally {
-                if (conn != null) {
-                    conn.disconnect();
+            } catch (Exception outerEx) {
+                // Catch any unexpected exception at the outermost level
+                System.err.println("[CACHED-BG] UNEXPECTED ERROR in run(): " + outerEx.getMessage());
+                outerEx.printStackTrace(System.err);
+                // Still try to notify waiting thread
+                try {
+                    synchronized (lock) {
+                        inProgress.put(cacheKey, Boolean.FALSE);
+                        lock.notifyAll();
+                    }
+                } catch (Exception notifyEx) {
+                    System.err.println("[CACHED-BG] Failed to notify waiting thread: " + notifyEx.getMessage());
                 }
-                activeCallCount.decrementAndGet();
-            }
-
-            LogContext ctx = new LogContext();
-            ctx.setCaller("BackgroundThread", "N/A", tc.httpMethod, tc.apiUrl);
-            ctx.setTarget(tc.name, tc.apiUrl, tc.httpMethod, tc.subType, "CACHED-BG");
-               
-            long durationMs = System.currentTimeMillis() - startTime;
-
-            // Update cache
-            CachedResult cr = new CachedResult();
-            cr.httpCode = apiCode;
-            cr.data = apiData;
-            cr.errorMsg = errorMsg;
-            cr.durationMs = durationMs;
-            cr.timestamp = System.currentTimeMillis();
-            cache.put(cacheKey, cr);
-
-            // Log
-            logCallAsync(ctx);
-
-            consoleLog("ApiCheckServlet: [CACHED-BG] '" + cacheKey + "' finished in " + durationMs + "ms" + " code="
-                    + apiCode + (errorMsg != null ? " error=" + errorMsg : ""));
-
-            // Signal waiting servlet thread
-            synchronized (lock) {
-                inProgress.put(cacheKey, Boolean.FALSE);
-                lock.notifyAll();
             }
         }
     }
+    
 
     // ========================================================================
     // STATUS & RELOAD ACTIONS
     // ========================================================================
-
     private void handleStatus(HttpServletResponse response, PrintWriter out, LogContext ctx) {
         response.setStatus(200);
         StringBuilder json = new StringBuilder();
@@ -864,7 +940,7 @@ public class ApiCheckServlet extends HttpServlet {
         json.append(",\"maxBgThreads\":").append(MAX_BG_THREADS);
         json.append(",\"cacheResultEntries\":").append(cache.size());
         json.append(",\"cacheResultMemorySize\":").append(estimateCacheSizeBytes());
-       
+
         // Per-target cache status
         json.append(",\"targets\":[");
         boolean first = true;
@@ -907,16 +983,18 @@ public class ApiCheckServlet extends HttpServlet {
             first = false;
             json.append("\"").append(escapeJson(p.pattern())).append("\"");
         }
-        if (first) {json.append("\"none\"");};
+        if (first) {
+            json.append("\"none\"");
+        }
+        ;
         json.append("]");
         json.append("}");
 
         out.print(json.toString());
         out.flush();
 
-        ctx.setTarget("APICheckServlet", "N/A", "N/A", "Status", "0")
-            .setResults(200, "",json.toString())
-            .setResult(true, "Show servlet status");
+        ctx.setTarget("APICheckServlet", "N/A", "N/A", "Status", "0").setResults(200, "", json.toString())
+                .setResult(true, "Show servlet status");
 
         // make it final for thread use
         final LogContext finalCtx = ctx;
@@ -969,14 +1047,14 @@ public class ApiCheckServlet extends HttpServlet {
             }
 
             String keyParam = getItemString(profile, "SecretKey");
-            if (keyParam != null && keyParam.length() > 0) {  
+            if (keyParam != null && keyParam.length() > 0) {
                 secretKey = keyParam;
-                consoleLog("INFO","Servlet secret key initialized from config's database profile.");
-            } 
+                consoleLog("INFO", "Servlet secret key initialized from config's database profile.");
+            }
 
             loadBlockeIPList(profile);
             recycleQuietly(profile);
-            
+
             view = db.getView("($APIChecksActiveTargets)");
             if (view == null) {
                 consoleLog("ApiCheckServlet: ERROR — View '($APIChecksActiveTargets)' " + "not found in " + configDb);
