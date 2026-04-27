@@ -11,7 +11,7 @@ public class LogContext {
    public String action, target;
  
    // Target properties
-   public String targetName, targetApiUrl, mode, targetApiVersion;
+   public String targetName, targetApiUrl, mode, targetApiVersion, targetMethod;
 
    // Response properties
    public String errorMsg, apiData;
@@ -27,6 +27,10 @@ public class LogContext {
 
    public LogContext() {
       this.startTime = System.currentTimeMillis();
+   }
+
+   public LogContext(long startTime) {
+      this.startTime = startTime;
    }
 
   // Fluid setters to mimic Builder behavior
@@ -54,7 +58,7 @@ public class LogContext {
    public LogContext setTarget(String apiName, String apiUrl, String httpMethod, String apiVersion, String mode) {
        this.targetName = apiName;
        this.targetApiUrl = apiUrl;
-       this.httpMethod = httpMethod;
+       this.targetMethod = httpMethod;
        this.targetApiVersion = apiVersion;
        this.mode = mode;
       

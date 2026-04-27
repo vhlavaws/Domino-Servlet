@@ -427,12 +427,13 @@ public class ApiCheckServlet extends HttpServlet {
         buildApiResponse(tc, response, out, ctx, false, null, 0, null);  
         out.flush();
         ctx.setResult((errorMsg == null || errorMsg.length() == 0)? true : false, ctx.result);
+        long durationMs = System.currentTimeMillis() - startTime;
 
         // Log to a log database asynchronously to avoid slowing down the response.
+        ctx.setDurationMs(durationMs);
         final LogContext finalCtx = ctx;
         logCallAsync(finalCtx);
 
-        long durationMs = System.currentTimeMillis() - startTime;
         consoleLog("ApiCheckServlet: [SYNC] '" + tc.name + "' finished in " + durationMs + " ms" + " code=" + apiCode
                 + (errorMsg != null ? " error=" + errorMsg : ""));
     }
@@ -693,7 +694,7 @@ public class ApiCheckServlet extends HttpServlet {
             Boolean running = inProgress.get(key);
             if (running == null || !running) {
                 inProgress.put(key, Boolean.TRUE);
-                bgExecutor.submit(new BackgroundApiCaller(tc, key, lock));
+                bgExecutor.submit(new BackgroundApiCaller(tc, key, lock, ctx.ipAddress, ctx.userAgent, ctx.httpMethod, ctx.requestUri, ctx.action));
             }
         }
 
@@ -765,11 +766,21 @@ public class ApiCheckServlet extends HttpServlet {
         private final TargetConfig tc;
         private final String cacheKey;
         private final Object lock;
+        private final String callerIpAddress;
+        private final String callerUserAgent;
+        private final String callerHttpMethod;
+        private final String callerRequestUri;
+        private final String callerAction;
 
-        BackgroundApiCaller(TargetConfig tc, String cacheKey, Object lock) {
+        BackgroundApiCaller(TargetConfig tc, String cacheKey, Object lock, String callerIpAddress, String callerUserAgent, String callerHttpMethod, String callerRequestUri, String callerAction) {
             this.tc = tc;
             this.cacheKey = cacheKey;
             this.lock = lock;
+            this.callerIpAddress = callerIpAddress;
+            this.callerUserAgent = callerUserAgent;
+            this.callerHttpMethod = callerHttpMethod;
+            this.callerRequestUri = callerRequestUri;
+            this.callerAction = callerAction;
         }
 
         @Override
@@ -874,9 +885,16 @@ public class ApiCheckServlet extends HttpServlet {
                 long durationMs = System.currentTimeMillis() - startTime;
 
                 try {
-                    LogContext ctx = new LogContext();
-                    ctx.setCaller("BackgroundThread", "N/A", tc.httpMethod, tc.apiUrl);
-                    ctx.setTarget(tc.name, tc.apiUrl, tc.httpMethod, tc.subType, "CACHED-BG");
+                    LogContext ctx = new LogContext(startTime);
+                    ctx.setCaller(
+                            callerIpAddress != null ? callerIpAddress : "N/A",
+                            callerUserAgent != null ? callerUserAgent : "N/A",
+                            callerHttpMethod != null ? callerHttpMethod : "N/A",
+                            callerRequestUri != null ? callerRequestUri : tc.apiUrl);
+                    ctx.setRequesContext(callerAction, cacheKey);
+                    ctx.setTarget(tc.name, tc.apiUrl, tc.httpMethod, tc.subType, "CACHED-BG")
+                            .setResults(apiCodeHolder[0], errorMsg, apiDataHolder[0])
+                            .setDurationMs(durationMs);
 
                     // Update cache
                     CachedResult cr = new CachedResult();
@@ -1198,6 +1216,7 @@ public class ApiCheckServlet extends HttpServlet {
             doc.replaceItemValue("TargetName", ctx.targetName);
             doc.replaceItemValue("ApiSubType", ctx.targetApiVersion);
             doc.replaceItemValue("ApiUrl", ctx.targetApiUrl);
+            doc.replaceItemValue("ApiMethod", ctx.targetMethod);
             doc.replaceItemValue("Mode", ctx.mode);
 
             doc.replaceItemValue("Caller_UserAgent", ctx.userAgent);
@@ -1206,7 +1225,7 @@ public class ApiCheckServlet extends HttpServlet {
             doc.replaceItemValue("Action", ctx.action);
             
             doc.replaceItemValue("HttpCode", ctx.httpCode);
-            doc.replaceItemValue("DurationMs", System.currentTimeMillis() - ctx.startTime);
+            doc.replaceItemValue("DurationMs", ctx.getDurationMs());
             
             doc.replaceItemValue("ProcessedTimestamp", session.createDateTime(new Date()));
             doc.replaceItemValue("ApiPayload", ctx.apiData != null ? ctx.apiData : ""); 
